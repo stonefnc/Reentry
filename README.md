@@ -16,7 +16,7 @@ Status: scaffold only. Every item below is planned until it is marked built.
 | `reentry prune`: retention of 7 daily, 4 weekly and 6 monthly backups, configurable | built, tested without Docker |
 | `reentry list`: show backups with size and checksum state | built, tested without Docker |
 | Exit codes and one log line per step | planned |
-| `docs/runbook.md`: generic ransomware recovery runbook | planned |
+| [`docs/runbook.md`](docs/runbook.md): generic ransomware recovery runbook | written, restore commands not run (no Docker) |
 | `test/e2e.sh`: backup, corrupt a copy, confirm verify catches it | planned |
 
 ## Requirements
