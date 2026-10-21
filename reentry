@@ -175,6 +175,74 @@ cmd_verify() {
   log "verify: all backups restore and match the source"
 }
 
+BACKUP_RE='^(.+)_([0-9]{8}T[0-9]{6}Z)\.sql\.gz$'
+
+# backup_files: every backup file name in BACKUP_DIR, newest first within each group
+backup_files() {
+  { ls -1 "$BACKUP_DIR" 2>/dev/null || true; } | grep -E "$BACKUP_RE" |
+    sed -E 's/^(.+)_([0-9]{8}T[0-9]{6}Z)\.sql\.gz$/\1 \2 &/' | sort -k1,1 -k2,2r | cut -d' ' -f3
+}
+
+# Keeps the newest backup of each of the last N days, ISO weeks and months that have one.
+# Needs bash 4 (associative arrays) and GNU date.
+prune_group() {
+  local dry=$1 keep_d=$2 keep_w=$3 keep_m=$4; shift 4
+  local f stamp day week month nd=0 nw=0 nm=0 keep
+  declare -A sd sw sm
+  for f in "$@"; do
+    [[ $f =~ $BACKUP_RE ]]; stamp="${BASH_REMATCH[2]}"
+    day="${stamp:0:8}"; month="${stamp:0:6}"
+    week="$(date -u -d "${day:0:4}-${day:4:2}-${day:6:2}" +%G-%V)"
+    keep=0
+    [ "$f" != "$1" ] || keep=1 # the newest backup of a group is never pruned, even with all limits at 0
+    if [ -z "${sd[$day]:-}" ] && [ "$nd" -lt "$keep_d" ]; then sd[$day]=1; nd=$((nd+1)); keep=1; fi
+    if [ -z "${sw[$week]:-}" ] && [ "$nw" -lt "$keep_w" ]; then sw[$week]=1; nw=$((nw+1)); keep=1; fi
+    if [ -z "${sm[$month]:-}" ] && [ "$nm" -lt "$keep_m" ]; then sm[$month]=1; nm=$((nm+1)); keep=1; fi
+    if [ "$keep" = 1 ]; then
+      log "prune: keep $f"
+    elif [ "$dry" = 1 ]; then
+      log "prune: would delete $f"
+    else
+      rm -f -- "$BACKUP_DIR/$f" "$BACKUP_DIR/$f.sha256"
+      log "prune: deleted $f"
+    fi
+  done
+}
+
+cmd_prune() {
+  local dry=0 d w m f key last=
+  [ "${1:-}" = "--dry-run" ] && dry=1
+  [ -z "${1:-}" ] || [ "$dry" = 1 ] || die 2 "prune: unknown option $1"
+  if [ -f "$ENV_FILE" ]; then set -a; . "$ENV_FILE"; set +a; fi
+  d="${REENTRY_KEEP_DAILY:-7}"; w="${REENTRY_KEEP_WEEKLY:-4}"; m="${REENTRY_KEEP_MONTHLY:-6}"
+  for f in "$d" "$w" "$m"; do
+    [[ $f =~ ^[0-9]+$ ]] || die 2 "prune: retention values must be whole numbers, got '$f'"
+  done
+  log "prune: keeping $d daily, $w weekly, $m monthly (dry run: $dry)"
+  local -a group=()
+  while IFS= read -r f; do
+    [[ $f =~ $BACKUP_RE ]]; key="${BASH_REMATCH[1]}"
+    if [ -n "$last" ] && [ "$key" != "$last" ]; then
+      prune_group "$dry" "$d" "$w" "$m" "${group[@]}"; group=()
+    fi
+    group+=("$f"); last="$key"
+  done < <(backup_files)
+  [ "${#group[@]}" -eq 0 ] || prune_group "$dry" "$d" "$w" "$m" "${group[@]}"
+  log "prune: done"
+}
+
+cmd_list() {
+  local f state any=0
+  while IFS= read -r f; do
+    any=1
+    if [ ! -f "$BACKUP_DIR/$f.sha256" ]; then state="no-checksum"
+    elif (cd "$BACKUP_DIR" && sha256sum -c --status "$f.sha256" 2>/dev/null); then state="ok"
+    else state="CHECKSUM-MISMATCH"; fi
+    printf '%s\t%s bytes\t%s\n' "$f" "$(wc -c < "$BACKUP_DIR/$f" | tr -d ' ')" "$state"
+  done < <(backup_files)
+  [ "$any" = 1 ] || log "list: no backups in $BACKUP_DIR"
+}
+
 cmd_up() {
   need_docker; load_env
   compose up -d --wait
@@ -192,8 +260,8 @@ usage: reentry <command>
   down     stop them and delete their data volumes
   backup   dump both databases to backups/ with SHA-256 checksums
   verify   restore the latest backups into throwaway containers and check them
-  prune    (planned)
-  list     (planned)
+  prune    apply retention (7 daily, 4 weekly, 6 monthly), add --dry-run to preview
+  list     show backups with size and checksum state
 EOF
 }
 
@@ -203,7 +271,8 @@ case "${1:-}" in
   backup) cmd_backup ;;
   verify) cmd_verify ;;
   _verify-engine) cmd_verify_engine "${2:?engine}" ;;
-  prune|list) die 2 "$1 is not implemented yet" ;;
+  prune) cmd_prune "${2:-}" ;;
+  list) cmd_list ;;
   -h|--help|help) usage ;;
   *) usage; exit 2 ;;
 esac

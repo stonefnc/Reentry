@@ -13,8 +13,8 @@ Status: scaffold only. Every item below is planned until it is marked built.
 | `compose/`: one MySQL and one PostgreSQL instance, each seeded with a small fake sample database | written, not yet run (no Docker on the build machine) |
 | `reentry backup`: compressed dumps with a SHA-256 checksum file, named by database and timestamp, written to `backups/` | written, not yet run |
 | `reentry verify`: restore the latest backup into a throwaway container, compare row counts per table with the source, run a basic integrity query, exit non-zero on any mismatch | written, restore path not yet run |
-| `reentry prune`: retention of 7 daily, 4 weekly and 6 monthly backups, configurable | planned |
-| `reentry list`: show backups with size and checksum state | planned |
+| `reentry prune`: retention of 7 daily, 4 weekly and 6 monthly backups, configurable | built, tested without Docker |
+| `reentry list`: show backups with size and checksum state | built, tested without Docker |
 | Exit codes and one log line per step | planned |
 | `docs/runbook.md`: generic ransomware recovery runbook | planned |
 | `test/e2e.sh`: backup, corrupt a copy, confirm verify catches it | planned |
@@ -30,8 +30,17 @@ cp .env.example .env     # then set the passwords
 ./reentry up             # start MySQL and PostgreSQL
 ./reentry backup         # dump both databases into backups/
 ./reentry verify         # restore the latest backups and check them
+./reentry list           # backups with size and checksum state
+./reentry prune          # apply retention (add --dry-run to preview)
 ./reentry down           # stop and delete the data volumes
 ```
+
+`prune` works on each engine and database separately. It keeps the newest
+backup of each of the last 7 days, 4 ISO weeks and 6 months that have one,
+and deletes the rest along with their `.sha256` files. Set
+`REENTRY_KEEP_DAILY`, `REENTRY_KEEP_WEEKLY` and `REENTRY_KEEP_MONTHLY` in
+`.env` to change the numbers. The newest backup of a group is never deleted,
+even if every limit is 0. It needs bash 4 and GNU date (Linux, WSL, Git Bash).
 
 `verify` handles each engine in turn. For the latest backup it checks the
 SHA-256 file and gzip integrity, starts a throwaway container with no
@@ -72,3 +81,6 @@ restore has been run. Run so far: `bash -n reentry`, the usage output, and
 `verify` against a stub `docker` command, which confirmed the checksum
 mismatch and no-backup-found paths exit 1. The restore, row count and
 integrity steps are untested.
+
+`bash test/prune.sh` covers prune and list on fake backup files and needs no
+Docker. It passed (13 checks) under WSL bash.
