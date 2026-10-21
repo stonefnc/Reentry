@@ -13,9 +13,10 @@ log() { printf '%s reentry: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 die() { local code=$1; shift; log "ERROR: $*"; exit "$code"; }
 
 # Leftovers of the step in flight, removed on exit, Ctrl-C or kill.
-CLEAN_BASE="" CLEAN_CONTAINER=""
+CLEAN_BASE="" CLEAN_CONTAINER="" CLEAN_OFF=()
 cleanup() {
   [ -z "$CLEAN_BASE" ] || rm -f -- "$CLEAN_BASE.partial" "$CLEAN_BASE.counts" "$CLEAN_BASE.sha256"
+  [ "${#CLEAN_OFF[@]}" -eq 0 ] || rm -f -- "${CLEAN_OFF[@]}"
   [ -z "$CLEAN_CONTAINER" ] || docker rm -f "$CLEAN_CONTAINER" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -143,10 +144,70 @@ checksum_ok() {
   [ -f "$BACKUP_DIR/$1.sha256" ] && (cd "$BACKUP_DIR" && sha256sum -c --status "$1.sha256" 2>/dev/null)
 }
 
+# offhost_setup: reads REENTRY_OFFHOST_DEST and sets OFFHOST_KIND (none, path or remote),
+# OFFHOST_HOST and OFFHOST_PATH. A destination like host:/dir goes over rsync and ssh,
+# anything else is a folder, for example a mounted share.
+OFFHOST_KIND=none OFFHOST_HOST="" OFFHOST_PATH=""
+offhost_setup() {
+  local d="${REENTRY_OFFHOST_DEST:-}" t
+  OFFHOST_KIND=none
+  [ -n "$d" ] || return 0
+  [[ $d =~ ^[A-Za-z0-9_./@:+-]+$ ]] || die 2 "REENTRY_OFFHOST_DEST may only contain letters, digits and _ . / @ : + -"
+  if [[ $d =~ ^([^/:]+):(.+)$ ]]; then
+    for t in rsync ssh; do command -v "$t" >/dev/null 2>&1 || die 3 "$t not found on PATH, it is needed for a remote REENTRY_OFFHOST_DEST"; done
+    OFFHOST_KIND=remote OFFHOST_HOST="${BASH_REMATCH[1]}" OFFHOST_PATH="${BASH_REMATCH[2]}"
+  else
+    OFFHOST_KIND=path OFFHOST_PATH="$d"
+    [ "$(readlink -m -- "$d")" != "$(readlink -m -- "$BACKUP_DIR")" ] || die 2 "REENTRY_OFFHOST_DEST is the backup folder itself"
+  fi
+}
+
+# offhost_discard <file name>: best effort removal of a copy that failed its check
+offhost_discard() {
+  local f
+  for f in "$1" "$1.counts" "$1.sha256"; do
+    case "$OFFHOST_KIND" in
+      path) rm -f -- "$OFFHOST_PATH/$f" ;;
+      remote) ssh "$OFFHOST_HOST" "rm -f -- '$OFFHOST_PATH/$f'" >/dev/null 2>&1 || true ;;
+    esac
+  done
+}
+
+# offhost_copy <file name>: copies the dump and its sidecars, then re-checks the SHA-256 file at
+# the destination. Returns 1 on any problem. It never touches the local backup.
+offhost_copy() {
+  local name=$1 f
+  local -a files=("$name")
+  if [ "$OFFHOST_KIND" = none ]; then
+    log "backup: off-host copy skipped, REENTRY_OFFHOST_DEST is not set"
+    return 0
+  fi
+  [ ! -f "$BACKUP_DIR/$name.counts" ] || files+=("$name.counts")
+  files+=("$name.sha256")
+  case "$OFFHOST_KIND" in
+    path)
+      # never create the folder, an unmounted share would then fill the local disk
+      [ -d "$OFFHOST_PATH" ] && [ -w "$OFFHOST_PATH" ] || { log "ERROR: off-host folder $OFFHOST_PATH is missing or not writable"; return 1; }
+      for f in "${files[@]}"; do
+        CLEAN_OFF+=("$OFFHOST_PATH/.$f.tmp")
+        cp -- "$BACKUP_DIR/$f" "$OFFHOST_PATH/.$f.tmp" && mv -f -- "$OFFHOST_PATH/.$f.tmp" "$OFFHOST_PATH/$f" ||
+          { log "ERROR: could not copy $f to $OFFHOST_PATH"; offhost_discard "$name"; return 1; }
+      done
+      (cd "$OFFHOST_PATH" && sha256sum -c --status "$name.sha256" 2>/dev/null) ||
+        { log "ERROR: the copy of $name at $OFFHOST_PATH fails its SHA-256 check"; offhost_discard "$name"; return 1; } ;;
+    remote)
+      (cd "$BACKUP_DIR" && rsync -a -- "${files[@]}" "$OFFHOST_HOST:$OFFHOST_PATH/") ||
+        { log "ERROR: rsync to $OFFHOST_HOST:$OFFHOST_PATH failed"; offhost_discard "$name"; return 1; }
+      ssh "$OFFHOST_HOST" "cd '$OFFHOST_PATH' && sha256sum -c --status '$name.sha256'" >/dev/null 2>&1 ||
+        { log "ERROR: the copy of $name at $OFFHOST_HOST:$OFFHOST_PATH fails its SHA-256 check"; offhost_discard "$name"; return 1; } ;;
+  esac
+  log "backup: off-host copy of $name verified at ${REENTRY_OFFHOST_DEST}"
+}
+
 # Runs in its own process (see cmd_backup) so one engine failing never stops the other.
 cmd_backup_engine() {
   local engine=$1 db src stamp name base marker before after after_tail hash manifest=0
-  need_docker; load_env; engine_setup "$engine"
+  need_docker; load_env; engine_setup "$engine"; offhost_setup
   require_running "$src"
   case "$engine" in mysql) marker='Dump completed' ;; postgres) marker='dump complete' ;; esac
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -179,6 +240,7 @@ cmd_backup_engine() {
   mv "$base.partial" "$base"
   CLEAN_BASE=""
   log "backup $engine/$db: ok $name ($(wc -c < "$base" | tr -d ' ') bytes, row counts $([ "$manifest" = 1 ] && echo recorded || echo not recorded))"
+  offhost_copy "$name" || die 1 "backup $engine/$db: off-host copy FAILED, the local backup $name is kept"
 }
 
 run_engines() { # run_engines <internal command>: runs both engines, returns the worst exit code
@@ -190,6 +252,7 @@ run_engines() { # run_engines <internal command>: runs both engines, returns the
 }
 
 cmd_backup() {
+  offhost_setup
   take_lock
   run_engines _backup-engine || die $? "backup: FAILED, see the errors above"
   log "backup: done"
@@ -235,6 +298,21 @@ integrity_check() {
   esac
 }
 
+# restore_into <engine> <container> <database> <file name> [single]: loads a dump into an existing
+# database. With "single" a PostgreSQL load runs as one transaction, so a failure changes nothing.
+restore_into() {
+  local engine=$1 c=$2 db=$3 name=$4 single=${5:-}
+  case "$engine" in
+    mysql) gzip -dc "$BACKUP_DIR/$name" | docker exec -i "$c" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -h127.0.0.1 -uroot "$1"' _ "$db" ;;
+    postgres)
+      if [ "$single" = single ]; then
+        gzip -dc "$BACKUP_DIR/$name" | docker exec -i "$c" psql -U postgres -d "$db" -q -v ON_ERROR_STOP=1 -1 -f - -o /dev/null
+      else
+        gzip -dc "$BACKUP_DIR/$name" | docker exec -i "$c" psql -U postgres -d "$db" -q -v ON_ERROR_STOP=1 -o /dev/null
+      fi ;;
+  esac
+}
+
 # Runs in its own process (see cmd_verify) so set -e and die work normally for one engine.
 cmd_verify_engine() {
   local engine=$1 db src image name tmp want got
@@ -262,10 +340,7 @@ cmd_verify_engine() {
   wait_ready "$engine" "$tmp" || die 1 "verify $engine/$db: throwaway container did not become ready"
 
   log "verify $engine/$db: restoring $name"
-  case "$engine" in
-    mysql) gzip -dc "$BACKUP_DIR/$name" | docker exec -i "$tmp" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -h127.0.0.1 -uroot "$1"' _ "$db" ;;
-    postgres) gzip -dc "$BACKUP_DIR/$name" | docker exec -i "$tmp" psql -U postgres -d "$db" -q -v ON_ERROR_STOP=1 -o /dev/null ;;
-  esac || die 1 "verify $engine/$db: restore failed"
+  restore_into "$engine" "$tmp" "$db" "$name" || die 1 "verify $engine/$db: restore failed"
 
   if [ -f "$BACKUP_DIR/$name.counts" ]; then
     want="$(cat "$BACKUP_DIR/$name.counts")"
@@ -292,6 +367,103 @@ cmd_verify() {
   take_lock
   run_engines _verify-engine || die $? "verify: FAILED, see the errors above"
   log "verify: all latest backups restore and match"
+}
+
+# db_exists <engine> <container> <database>: succeeds if the database exists on the target
+db_exists() {
+  local n
+  case "$1" in
+    mysql) n="$(sql mysql "$2" information_schema "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='$3'")" || return 1 ;;
+    postgres) n="$(sql postgres "$2" postgres "SELECT COUNT(*) FROM pg_database WHERE datname='$3'")" || return 1 ;;
+  esac
+  [ "$n" = 1 ]
+}
+
+# create_db <engine> <container> <database>
+create_db() {
+  case "$1" in
+    mysql) docker exec "$2" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -h127.0.0.1 -uroot -e "CREATE DATABASE \`$1\`"' _ "$3" ;;
+    postgres) docker exec "$2" psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$3\"" ;;
+  esac
+}
+
+# Restores a chosen backup into a database the user picks. Unlike verify it writes to a
+# container that is not a throwaway, so it asks first unless the target is a verify container.
+cmd_restore() {
+  local engine="${1:-}" name="" target="" rdb="" yes=0 db src key want got existing answer label
+  [ $# -gt 0 ] || die 2 "restore: name an engine, mysql or postgres"
+  shift
+  case "$engine" in mysql|postgres) ;; *) die 2 "restore: engine must be mysql or postgres, got '$engine'" ;; esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1 ;;
+      --backup|--target|--database)
+        [ $# -ge 2 ] || die 2 "restore: $1 needs a value"
+        case "$1" in --backup) name=$2 ;; --target) target=$2 ;; --database) rdb=$2 ;; esac
+        shift ;;
+      *) die 2 "restore: unknown option $1" ;;
+    esac
+    shift
+  done
+  need_docker; load_env; engine_setup "$engine"
+  [ -n "$target" ] || target=$src
+  [[ $target =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die 2 "restore: bad container name '$target'"
+  [ -z "$rdb" ] || [[ $rdb =~ ^[A-Za-z0-9_]+$ ]] || die 2 "restore: --database may only contain letters, digits and underscores"
+
+  take_lock
+  if [ -n "$name" ]; then
+    [[ $name =~ $BACKUP_RE ]] && [[ ${BASH_REMATCH[1]} == "${engine}_"* ]] ||
+      die 2 "restore: '$name' is not a $engine backup file name"
+    key="${BASH_REMATCH[1]}"; db="${key#"${engine}_"}"
+    [ -f "$BACKUP_DIR/$name" ] || die 1 "restore: $name not found in $BACKUP_DIR"
+  else
+    name="$(latest_backup "$engine" "$db")"
+    [ -n "$name" ] || die 1 "restore $engine/$db: no backup found in $BACKUP_DIR"
+  fi
+  [ -n "$rdb" ] || rdb=$db
+  label="restore $engine/$rdb"
+  log "$label: using $name"
+  checksum_ok "$name" || die 1 "$label: checksum file missing or SHA-256 mismatch for $name"
+  gzip -t "$BACKUP_DIR/$name" || die 1 "$label: $name is not valid gzip"
+  require_running "$target"
+
+  existing=""
+  if db_exists "$engine" "$target" "$rdb"; then
+    existing="$(table_counts "$engine" "$target" "$rdb")" || die 1 "$label: could not read the tables of $target"
+    if [ "$engine" = postgres ] && [ -n "$existing" ]; then
+      die 1 "$label: database $rdb on $target already has tables, restore into an empty database with --database NAME"
+    fi
+  fi
+
+  if [ "$(docker inspect -f '{{index .Config.Labels "reentry.verify"}}' "$target" 2>/dev/null || true)" = 1 ]; then
+    log "$label: $target is a throwaway verify container, no confirmation needed"
+  elif [ "$yes" = 1 ]; then
+    log "$label: --yes given, writing into $target without asking"
+  else
+    [ -t 0 ] || die 2 "restore writes into container $target, pass --yes to confirm"
+    printf 'About to restore %s into database %s on container %s.\n' "$name" "$rdb" "$target" >&2
+    if [ -n "$existing" ]; then printf 'The database has %s tables. Tables with the same names will be replaced.\n' "$(grep -c . <<<"$existing")" >&2; fi
+    read -r -p "Type yes to go on: " answer
+    [ "$answer" = yes ] || die 1 "aborted, nothing was written"
+  fi
+
+  db_exists "$engine" "$target" "$rdb" || { log "$label: creating database $rdb on $target"; create_db "$engine" "$target" "$rdb" || die 1 "$label: could not create database $rdb"; }
+  log "$label: restoring $name into $target"
+  restore_into "$engine" "$target" "$rdb" "$name" single || die 1 "$label: restore failed, the target may be partly loaded"
+
+  if [ -f "$BACKUP_DIR/$name.counts" ]; then
+    want="$(cat "$BACKUP_DIR/$name.counts")"
+    got="$(table_counts "$engine" "$target" "$rdb")" || die 1 "$label: restored, but could not read table counts to check them"
+    if [ "$want" != "$got" ]; then
+      log "$label: expected row counts:"; printf '%s\n' "$want" >&2
+      log "$label: row counts now in $target:"; printf '%s\n' "$got" >&2
+      die 1 "$label: row counts differ from the backup"
+    fi
+    log "$label: row counts match ($(printf '%s' "$want" | tr '\n' ' '))"
+  else
+    log "$label: WARN no row count manifest, row counts were not checked"
+  fi
+  log "$label: done, $name is in database $rdb on $target"
 }
 
 # Keeps the newest backup of each of the last N days, ISO weeks and months that have one.
@@ -396,12 +568,14 @@ usage: reentry <command>
   verify   restore the latest backups into throwaway containers and check them
   prune    apply retention (7 daily, 4 weekly, 6 monthly), add --dry-run to preview
   list     show backups with size and checksum state
+  restore  <mysql|postgres> [--backup FILE] [--target CONTAINER] [--database NAME] [--yes]
+           restore the latest (or a named) backup into a running container, asks first
 EOF
 }
 
 case "${1:-}" in
   -h|--help|help) usage; exit 0 ;;
-  up|down|backup|verify|prune|list|_backup-engine|_verify-engine) ;;
+  up|down|backup|verify|prune|list|restore|_backup-engine|_verify-engine) ;;
   *) usage; exit 2 ;;
 esac
 
@@ -416,6 +590,7 @@ case "$1" in
   verify) cmd_verify ;;
   prune) cmd_prune "${2:-}" ;;
   list) cmd_list ;;
+  restore) cmd_restore "${@:2}" ;;
   _backup-engine) cmd_backup_engine "${2:?engine}" ;;
   _verify-engine) cmd_verify_engine "${2:?engine}" ;;
 esac

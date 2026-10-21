@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# A stand-in for rsync, used by test/fake.sh. The destination host:path is treated as a local
+# folder, so it only copies. Knobs: FAKE_RSYNC_FAIL=1 (exit 23), FAKE_RSYNC_CORRUPT=1 (damage the
+# copied dump so its SHA-256 check fails).
+[ -z "${FAKE_RSYNC_FAIL:-}" ] || exit 23
+args=("$@")
+dest="${args[-1]}"; dest="${dest#*:}"
+for f in "${args[@]:0:${#args[@]}-1}"; do
+  case "$f" in -a|--) continue ;; esac
+  cp -- "$f" "$dest"
+  if [ -n "${FAKE_RSYNC_CORRUPT:-}" ]; then case "$f" in *.sql.gz) printf x >> "$dest/${f##*/}" ;; esac; fi
+done

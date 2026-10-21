@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# A stand-in for ssh, used by test/fake.sh. It ignores the host and runs the command locally.
+bash -c "$2"

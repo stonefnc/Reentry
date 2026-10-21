@@ -47,6 +47,25 @@ failed or interrupted run leaves no backup and no leftovers. One engine
 failing does not stop the other. If rows changed during the dump, no counts
 file is written and `verify` falls back to the live source with a warning.
 
+#### Off-host copy
+
+Opt-in. Set `REENTRY_OFFHOST_DEST` in `.env` and each successful backup is
+copied, with its `.counts` and `.sha256` files, to that place. Unset, the step
+is skipped and one log line says so. The destination is one of:
+
+- A folder, such as a mounted share. It must already exist and be writable.
+  Reentry never creates it, because an unmounted share would then fill the
+  local disk.
+- `host:/path` (or `user@host:/path`), copied with `rsync` over `ssh`. Both
+  tools must be on `PATH` and ssh must work without a prompt.
+
+After the copy, `sha256sum -c` is run on the `.sha256` file at the destination.
+If the copy fails or does not match, the bad copy is removed from the
+destination, the run logs an error, and `backup` exits 1. The local backup is
+never touched by an off-host failure. The destination may only contain letters,
+digits and `_ . / @ : + -`, and may not be the backup folder itself.
+`prune` works on the local folder only and does not delete off-host copies.
+
 ### verify
 
 For each engine, takes the latest backup and checks the SHA-256 file and gzip
@@ -90,7 +109,7 @@ file in that folder).
 | Code | Meaning |
 |---|---|
 | 0 | ok |
-| 1 | the command failed, a check failed, or `list` found no backups or a bad checksum |
+| 1 | the command failed, a check failed (an off-host copy that fails counts), or `list` found no backups or a bad checksum |
 | 2 | usage error or bad setting |
 | 3 | prerequisite missing (Docker, a tool, or a container not running) |
 
@@ -104,8 +123,10 @@ written to be followed under pressure.
 
 ## Limits
 
-- Backups stay in a local folder. Copying them somewhere the database host
-  cannot write to is planned and not built. Until then, do it yourself.
+- Backups stay in a local folder unless you set `REENTRY_OFFHOST_DEST`. For the
+  copy to protect against ransomware, the destination must be a place the
+  database host cannot delete from or overwrite, such as an append-only or
+  versioned store. Reentry cannot check that.
 - The checksum file sits next to the backup. It detects damage, not
   tampering. Record hashes somewhere else at backup time.
 - Dumps hold tables and data, not database users or grants.
@@ -117,6 +138,7 @@ written to be followed under pressure.
 |---|---|
 | Compose with seeded MySQL and PostgreSQL | written, not run (no Docker on the build machine) |
 | `backup`, `verify` | written, logic tested against a fake `docker`, not run against real Docker |
+| Off-host copy (folder and rsync/ssh) | written, logic tested against a fake `docker`, `rsync` and `ssh`, not run against real Docker, a real ssh host or a real share |
 | `prune`, `list` | built and tested, no Docker needed |
 | Runbook | written, restore commands not run |
 | End-to-end test (`test/e2e.sh`) | written, not run (needs Docker) |
@@ -129,7 +151,7 @@ the corruption test fails verify as expected. That has not been shown yet.
 | Command | Needs Docker | Result so far |
 |---|---|---|
 | `bash test/prune.sh` | no | 18 checks passed under WSL bash |
-| `bash test/fake.sh` | no | 21 checks passed under WSL bash |
+| `bash test/fake.sh` | no | 43 checks passed under WSL bash |
 | `bash test/e2e.sh` | yes | not run, only its syntax and the Docker-missing exit were checked |
 
 `test/e2e.sh` starts the sample databases if needed, takes a real backup in a

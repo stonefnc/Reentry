@@ -186,7 +186,10 @@ Keep the record somewhere the affected systems cannot reach.
 
 ## Limits of the tooling in this repo
 
-Reentry writes backups to a local folder, and nothing in the repo copies them
-elsewhere yet (planned). A ransomware attack on the host that holds `backups/`
-can encrypt the backups as well. Keep a copy somewhere the database host
-cannot write to or delete from, and run `./reentry verify` often.
+Reentry writes backups to a local folder. It can copy each backup off the host
+when `REENTRY_OFFHOST_DEST` is set, but only if you set it. A ransomware attack
+on the host that holds `backups/` can encrypt the backups as well, and it can
+reach an off-host destination that the host can write to or delete from. Use a
+destination the database host cannot delete from or overwrite, and run
+`./reentry verify` often. Hashes of the off-host copies are the thing to
+compare against in step 3.
