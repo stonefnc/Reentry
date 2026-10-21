@@ -64,12 +64,15 @@ With encryption on, the finished and checked dump is encrypted and stored as
 failure leaves no plaintext behind. The `.sha256` file covers the file as
 stored, so `list`, `prune` and the off-host check work without the key.
 `verify` and `restore` decrypt on the fly and tell `gpg` and `openssl` files
-apart by their header, so they only need the key file. A missing or empty key
-file stops the run before anything is dumped or restored (exit 3), an unset
-`REENTRY_ENCRYPT_KEY_FILE` or unknown tool is a bad setting (exit 2), and there
-is never a fallback to a plaintext backup. A wrong key fails `verify` and
+apart by their header, so they only need the key file. A missing key file, an
+empty one or one whose first line is empty stops the run before anything is
+dumped or restored (exit 3), an unset `REENTRY_ENCRYPT_KEY_FILE` or unknown tool
+is a bad setting (exit 2), and there is never a fallback to a plaintext backup.
+A wrong key fails `verify` and
 `restore` with exit 1. Encrypted and plaintext backups can sit in the same
 folder. `.counts` files are not encrypted and hold table names and row counts.
+Reentry runs with umask 077, so every file it writes, including the plaintext
+dump before it is encrypted, is readable by its owner only.
 This protects backups at rest. It does not hide data from anyone who holds the
 key file, and the gpg and openssl tools are used as installed on your system.
 
@@ -181,7 +184,8 @@ the command for real recovery, so it writes where you point it.
   MySQL container with `MYSQL_ROOT_PASSWORD` set, or a PostgreSQL container
   with the `postgres` user and trust access from inside the container.
 - The database name defaults to the one in the backup file name. `--database`
-  restores into another name. A database that does not exist is created.
+  restores into another name. Either name may only contain letters, digits and
+  underscores. A database that does not exist is created.
 - Before anything is written the SHA-256 file and gzip integrity are checked,
   and a backup that fails is refused.
 - Safety: unless the target is a `verify` throwaway container, `restore` shows
@@ -293,7 +297,7 @@ the corruption test fails verify as expected. That has not been shown yet.
 | Command | Needs Docker | Result so far |
 |---|---|---|
 | `bash test/prune.sh` | no | 18 checks passed under WSL bash |
-| `bash test/fake.sh` | no | 197 checks passed under WSL bash (uses the installed `gpg` and `openssl`, and skips a tool that is missing) |
+| `bash test/fake.sh` | no | 217 checks passed under WSL bash (uses the installed `gpg` and `openssl`, and skips a tool that is missing) |
 | `bash test/e2e.sh` | yes | not run, only its syntax and the Docker-missing exit were checked |
 
 `test/e2e.sh` starts the sample databases if needed, takes a real backup in a

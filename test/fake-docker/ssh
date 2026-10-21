@@ -1,3 +1,5 @@
 #!/usr/bin/env bash
 # A stand-in for ssh, used by test/fake.sh. It ignores the host and runs the command locally.
+# Like the real ssh it swallows standard input unless that is a terminal.
+[ -t 0 ] || cat > /dev/null
 bash -c "$2"

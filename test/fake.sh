@@ -14,7 +14,7 @@ check() { # check <description> <command...>
   if "$@" >/dev/null 2>&1; then echo "ok   $what"; else echo "FAIL $what"; fail=1; fi
 }
 fresh() { export REENTRY_BACKUP_DIR="$tmp/$1"; rm -rf "$REENTRY_BACKUP_DIR"; : > "$FAKE_LOG"; }
-run() { "$ROOT/reentry" "$@" >"$tmp/out" 2>&1; rc=$?; }
+run() { "$ROOT/reentry" "$@" >"$tmp/out" 2>&1 </dev/null; rc=$?; }
 has() { grep -q -- "$1" "$tmp/out"; }
 files() { ls "$REENTRY_BACKUP_DIR" | grep -c "$1"; }
 
@@ -23,6 +23,8 @@ run backup
 check "backup exits 0" [ "$rc" = 0 ]
 check "two dumps written" [ "$(files '\.sql\.gz$')" = 2 ]
 check "each dump has a sidecar and a counts manifest" [ "$(files '\.sha256$')$(files '\.counts$')" = 22 ]
+check "the counts manifest lists every table" [ "$(grep -c '=' "$REENTRY_BACKUP_DIR"/mysql_*.counts)" = 4 ]
+check "backups are readable by their owner only" [ "$(stat -c %a "$REENTRY_BACKUP_DIR"/mysql_*.sql.gz)" = 600 ]
 check "no .partial left behind" [ "$(files partial)" = 0 ]
 
 run verify
@@ -162,6 +164,14 @@ run restore mysql --backup ../etc/passwd --yes
 check "a path as the backup name exits 2" [ "$rc" = 2 ]
 run restore mysql --backup postgres_shop_20260101T000000Z.sql.gz --yes
 check "a backup of the other engine exits 2" [ "$rc" = 2 ]
+# a database name from the file name goes into SQL, so it must pass the same check as --database
+odd="mysql_my-db_20260101T000000Z.sql.gz"
+printf x > "$REENTRY_BACKUP_DIR/$odd"; (cd "$REENTRY_BACKUP_DIR" && sha256sum "$odd" > "$odd.sha256")
+: > "$FAKE_LOG"
+run restore mysql --backup "$odd" --yes
+check "a database name with other characters taken from the file name exits 2" [ "$rc" = 2 ]
+check "and nothing is created or loaded" bash -c "! grep -q '^load\|^create' '$FAKE_LOG'"
+rm -f "$REENTRY_BACKUP_DIR/$odd" "$REENTRY_BACKUP_DIR/$odd.sha256"
 run restore mysql --backup mysql_shop_20200101T000000Z.sql.gz --yes
 check "a missing named backup exits 1" [ "$rc" = 1 ]
 run restore mysql --target "bad name" --yes
@@ -222,16 +232,23 @@ fresh o
 REENTRY_ENCRYPT=openssl run backup
 check "encryption on with no key setting exits 2" [ "$rc" = 2 ]
 check "and no backup is taken" [ ! -e "$REENTRY_BACKUP_DIR" ] 
-fresh p
+fresh p; mkdir -p "$REENTRY_BACKUP_DIR"
 REENTRY_ENCRYPT=openssl REENTRY_ENCRYPT_KEY_FILE="$tmp/no-such-key" run backup
 check "encryption on with a missing key file exits 3" [ "$rc" = 3 ]
-check "no plaintext backup is written as a fallback" [ "$(files '\.sql\.gz')" = 0 ]
+check "no plaintext backup is written as a fallback" [ "$(ls -A "$REENTRY_BACKUP_DIR" | grep -vc '^\.reentry\.lock$')" = 0 ]
 fresh q
 REENTRY_ENCRYPT=rot13 REENTRY_ENCRYPT_KEY_FILE="$tmp/key" run backup
 check "an unknown encryption tool exits 2" [ "$rc" = 2 ]
 : > "$tmp/empty-key"
 REENTRY_ENCRYPT=openssl REENTRY_ENCRYPT_KEY_FILE="$tmp/empty-key" run backup
 check "an empty key file exits 3" [ "$rc" = 3 ]
+# openssl accepts an empty first line as an empty passphrase, so it must be refused here
+printf '\nthe passphrase is on the second line\n' > "$tmp/blank-first-line-key"
+fresh q2; mkdir -p "$REENTRY_BACKUP_DIR"
+REENTRY_ENCRYPT=openssl REENTRY_ENCRYPT_KEY_FILE="$tmp/blank-first-line-key" run backup
+check "a key file with an empty first line exits 3" [ "$rc" = 3 ]
+check "and the empty first line is named" has "empty first line"
+check "and nothing is written" [ "$(ls -A "$REENTRY_BACKUP_DIR" | grep -vc '^\.reentry\.lock$')" = 0 ]
 
 # catalog and status
 fresh s1
@@ -301,6 +318,29 @@ check "and status exits 1 for it" [ "$rc" = 1 ]
 run prune
 check "prune keeps the catalog in step (rows survive, off-host state kept)" [ "$(cut -f6 "$REENTRY_BACKUP_DIR/.catalog.tsv" | grep -c '^failed$')" = 2 ]
 
+# a run that is refused the lock must not touch the temporary catalog of the run that holds it
+fresh t1; mkdir -p "$REENTRY_BACKUP_DIR"
+( flock 9; : > "$tmp/held"; exec sleep 30 ) 9>"$REENTRY_BACKUP_DIR/.reentry.lock" &
+holder=$!
+for _ in $(seq 50); do [ -e "$tmp/held" ] && break; sleep 0.1; done
+: > "$REENTRY_BACKUP_DIR/.catalog.tsv.tmp"
+run backup
+check "a backup refused by the lock exits 1" [ "$rc" = 1 ]
+check "and names the lock" has "another reentry command is running"
+check "it leaves the temporary catalog of the lock holder alone" [ -e "$REENTRY_BACKUP_DIR/.catalog.tsv.tmp" ]
+run status
+check "status leaves a temporary catalog alone too" [ -e "$REENTRY_BACKUP_DIR/.catalog.tsv.tmp" ]
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null; rm -f "$tmp/held"
+
+# a catalog that cannot be written is a warning, never a failed backup
+fresh t2; off="$tmp/off-t2"; mkdir -p "$off" "$REENTRY_BACKUP_DIR"
+: > "$REENTRY_BACKUP_DIR/.catalog.tsv"
+ln -s /no-such-dir/catalog "$REENTRY_BACKUP_DIR/.catalog.tsv.tmp"
+REENTRY_OFFHOST_DEST="$off" run backup
+check "a catalog that cannot be written does not fail the backup" [ "$rc" = 0 ]
+check "it is logged as a warning" has "WARN could not update the catalog"
+check "both dumps are still copied off-host" [ "$(ls "$off" | grep -c '\.sql\.gz$')" = 2 ]
+
 # failure notification
 export NOTE="$tmp/note" FAKE_CURL_LOG="$tmp/curl.log"
 rm -f "$NOTE" "$FAKE_CURL_LOG"
@@ -329,8 +369,10 @@ check "an off-host failure keeps exit 1" [ "$rc" = 1 ]
 check "the event is offhost-failed" grep -q '^offhost-failed|' "$NOTE"
 check "one notice per failed run" [ "$(grep -c . "$NOTE")" = 1 ]
 rm -f "$NOTE"
-FAKE_FAIL_DUMP=1 REENTRY_OFFHOST_DEST="$tmp/not-mounted" run backup
-check "a dump failure plus an off-host problem is a backup-failed event" grep -q '^backup-failed|' "$NOTE"
+FAKE_DOWN=reentry-mysql REENTRY_OFFHOST_DEST="$tmp/not-mounted" run backup
+check "one engine failing and the other failing off-host is a backup-failed event" grep -q '^backup-failed|' "$NOTE"
+check "and not an offhost-failed event" bash -c "! grep -q '^offhost-failed|' '$NOTE'"
+check "the notice names both problems" grep -q 'not running.*off-host copy FAILED' "$NOTE"
 rm -f "$NOTE"
 REENTRY_NOTIFY_CMD='exit 7' FAKE_FAIL_DUMP=1 run backup
 check "a failing notify command never changes the exit code" [ "$rc" = 1 ]
@@ -402,12 +444,21 @@ check "off-host retention works over the remote path too" [ "$rc" = 0 ]
 check "the older remote copy is deleted and the newest kept" [ "$(ls "$off" | grep -c '20260102.*gz$')" = 1 ] 
 check "only one remote dump is left" [ "$(offcount "$off")" = 1 ]
 
+# the fake ssh swallows standard input like the real one, so every group must still be pruned
+fresh r7; off="$tmp/off-r7"; mkdir -p "$off"
+for s in 20260101T000000Z 20260102T000000Z 20260103T000000Z; do mkcopy "$off" mysql "$s"; mkcopy "$off" postgres "$s"; done
+REENTRY_OFFHOST_DEST="fakehost:$off" run prune
+check "remote off-host retention exits 0 with two groups" [ "$rc" = 0 ]
+check "it prunes the second group as well as the first" [ "$(offcount "$off")" = 2 ]
+check "the newest copy of each engine is kept" bash -c "[ -e '$off/mysql_shop_20260103T000000Z.sql.gz' ] && [ -e '$off/postgres_shop_20260103T000000Z.sql.gz' ]"
+
 fresh r5; off="$tmp/off-r5"; mkdir -p "$off"
 REENTRY_OFFHOST_DEST="$off" run backup
 check "catalog: both backups start as verified off-host" [ "$(cut -f6 "$REENTRY_BACKUP_DIR/.catalog.tsv" | grep -c '^verified$')" = 2 ]
 mkcopy "$off" mysql 20990101T000000Z
 REENTRY_OFFHOST_KEEP_DAILY=0 REENTRY_OFFHOST_DEST="$off" run prune
-check "the real backup's mysql copy is pruned off-host by the newer copy" [ "$(ls "$off" | grep -c '^mysql_shop_2026')" = 0 ]
+check "the real backup's mysql copy is pruned off-host by the newer copy" [ "$(ls "$off" | grep -c '^mysql_shop_.*\.sql\.gz$')" = 1 ]
+check "and the newer copy is the one kept" [ -e "$off/mysql_shop_20990101T000000Z.sql.gz" ]
 check "the local backups are untouched by off-host retention" [ "$(files '\.sql\.gz$')" = 2 ]
 check "the catalog now shows that backup as no longer off-host" [ "$(grep '^mysql' "$REENTRY_BACKUP_DIR/.catalog.tsv" | cut -f6)" = none ]
 check "the postgres copy is still recorded as verified" [ "$(grep '^postgres' "$REENTRY_BACKUP_DIR/.catalog.tsv" | cut -f6)" = verified ]

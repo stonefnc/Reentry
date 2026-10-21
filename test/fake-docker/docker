@@ -21,7 +21,8 @@ case "$1" in
 esac
 
 shift
-[ "$1" = -i ] && shift
+stdin=
+[ "$1" = -i ] && { stdin=1; shift; }
 container=$1
 
 count_of() {
@@ -52,6 +53,7 @@ case "$all" in
     printf 'customers\nproducts\norders\norder_items\n' ;;
   *pg_constraint*|*"LEFT JOIN"*) echo 0 ;;
   *"SELECT COUNT(*) FROM "*)
+    [ -z "$stdin" ] || cat > /dev/null # like the real client, exec -i reads stdin
     t="${all##*FROM }"; t="${t//\`/}"; t="${t//\"/}"; count_of "$t" ;;
   *) cat > /dev/null; echo "load $container" >> "${FAKE_LOG:-/dev/null}" ;; # a restore: read the dump from stdin
 esac

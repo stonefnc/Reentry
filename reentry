@@ -2,6 +2,9 @@
 # reentry: backups that prove they restore.
 # Exit codes: 0 ok, 1 command failed, 2 usage error, 3 prerequisite missing
 set -euo pipefail
+# Everything reentry writes is readable by its owner only. A dump is plaintext until it
+# is encrypted, and no database dump should be readable by other local users.
+umask 077
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 SELF="$ROOT/reentry"
@@ -20,6 +23,8 @@ die() {
 
 # Leftovers of the step in flight, removed on exit, Ctrl-C or kill.
 CLEAN_BASE="" CLEAN_CONTAINER="" CLEAN_OFF=() NOTIFY_CTX=""
+# set once this run, or the command that started it, holds the lock on the backup folder
+HAVE_LOCK="${_REENTRY_LOCKED:-}"
 cleanup() {
   local rc=$?
   # a failed backup or verify sends a notice, Ctrl-C and kill (128 and up) do not
@@ -29,7 +34,8 @@ cleanup() {
     [ -z "${_REENTRY_FAILS:-}" ] || rm -f -- "$_REENTRY_FAILS"
   fi
   [ -z "$CLEAN_BASE" ] || rm -f -- "$CLEAN_BASE.partial" "$CLEAN_BASE.plain.partial" "$CLEAN_BASE.counts" "$CLEAN_BASE.sha256"
-  [ -z "${CATALOG:-}" ] || rm -f -- "$CATALOG.tmp"
+  # the temporary catalog belongs to the run that holds the lock, a run that was refused it must leave it alone
+  [ -z "${CATALOG:-}" ] || [ -z "$HAVE_LOCK" ] || rm -f -- "$CATALOG.tmp"
   [ "${#CLEAN_OFF[@]}" -eq 0 ] || rm -f -- "${CLEAN_OFF[@]}"
   [ -z "$CLEAN_CONTAINER" ] || docker rm -f "$CLEAN_CONTAINER" >/dev/null 2>&1 || true
 }
@@ -88,6 +94,7 @@ take_lock() {
   mkdir -p "$BACKUP_DIR"
   exec 9>"$BACKUP_DIR/.reentry.lock"
   flock -n 9 || die 1 "another reentry command is running (lock: $BACKUP_DIR/.reentry.lock)"
+  HAVE_LOCK=1; export _REENTRY_LOCKED=1
 }
 
 # engine_setup <engine>: sets db, src (source container)
@@ -100,12 +107,14 @@ engine_setup() {
 }
 
 # sql <engine> <container> <database> <statement>: prints bare values, one per line
+# No -i: the statement is an argument, and an attached stdin would swallow the table
+# list that table_counts reads in a loop, so only the first table would be counted.
 sql() {
   local engine=$1 container=$2 db=$3 stmt=$4
   case "$engine" in
-    mysql) docker exec -i "$container" sh -c \
+    mysql) docker exec "$container" sh -c \
       'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -h127.0.0.1 -uroot -N -B "$1" -e "$2"' _ "$db" "$stmt" ;;
-    postgres) docker exec -i "$container" psql -U postgres -d "$db" -At -v ON_ERROR_STOP=1 -c "$stmt" ;;
+    postgres) docker exec "$container" psql -U postgres -d "$db" -At -v ON_ERROR_STOP=1 -c "$stmt" ;;
   esac
 }
 
@@ -193,15 +202,16 @@ catalog_rebuild() {
     fi
     [ -n "$off" ] || { off=none; off_at=-; }
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$size" "$mtime" "$cs" "$checked" "$off" "$off_at"
-  done < <(backup_index) > "$CATALOG.tmp"
-  mv -f -- "$CATALOG.tmp" "$CATALOG"
+  done < <(backup_index) > "$CATALOG.tmp" &&
+    mv -f -- "$CATALOG.tmp" "$CATALOG"
 }
 
 # catalog_set_off <file name> <verified|failed|none>: records the off-host state of one backup
 catalog_set_off() {
   [ -f "$CATALOG" ] || return 0
   awk -F'\t' -v OFS='\t' -v n="$1" -v s="$2" -v t="$(date -u +%Y-%m-%dT%H:%M:%SZ)" '$1==n{$6=s;$7=t} {print}' "$CATALOG" > "$CATALOG.tmp" &&
-    mv -f -- "$CATALOG.tmp" "$CATALOG"
+    mv -f -- "$CATALOG.tmp" "$CATALOG" ||
+    log "WARN could not update the catalog $CATALOG"
 }
 
 # catalog_update: a catalog problem is logged and never fails a backup or a prune
@@ -214,9 +224,12 @@ catalog_field() { [ -f "$CATALOG" ] && awk -F'\t' -v n="$1" -v c="$2" '$1==n{pri
 # names a file whose first line is the passphrase. The passphrase is never put on a command line.
 ENC_TOOL=""
 need_key() {
-  local k="${REENTRY_ENCRYPT_KEY_FILE:-}"
+  local k="${REENTRY_ENCRYPT_KEY_FILE:-}" first=""
   [ -n "$k" ] || die 2 "REENTRY_ENCRYPT_KEY_FILE must name the file that holds the encryption passphrase"
   { [ -f "$k" ] && [ -r "$k" ] && [ -s "$k" ]; } || die 3 "encryption key file $k is missing, unreadable or empty"
+  # openssl takes an empty first line as an empty passphrase without complaint
+  IFS= read -r first < "$k" || true
+  [ -n "$first" ] || die 3 "encryption key file $k has an empty first line, the passphrase is the first line of the file"
 }
 
 # need_key_for <file name>: an encrypted backup needs the key before anything else is tried
@@ -339,7 +352,7 @@ offhost_discard() {
   for f in "$1" "$1.counts" "$1.sha256"; do
     case "$OFFHOST_KIND" in
       path) rm -f -- "$OFFHOST_PATH/$f" ;;
-      remote) ssh "$OFFHOST_HOST" "rm -f -- '$OFFHOST_PATH/$f'" >/dev/null 2>&1 || true ;;
+      remote) ssh "$OFFHOST_HOST" "rm -f -- '$OFFHOST_PATH/$f'" </dev/null >/dev/null 2>&1 || true ;;
     esac
   done
 }
@@ -369,7 +382,7 @@ offhost_copy() {
     remote)
       (cd "$BACKUP_DIR" && rsync -a -- "${files[@]}" "$OFFHOST_HOST:$OFFHOST_PATH/") ||
         { log "ERROR: rsync to $OFFHOST_HOST:$OFFHOST_PATH failed"; offhost_discard "$name"; return 1; }
-      ssh "$OFFHOST_HOST" "cd '$OFFHOST_PATH' && sha256sum -c --status '$name.sha256'" >/dev/null 2>&1 ||
+      ssh "$OFFHOST_HOST" "cd '$OFFHOST_PATH' && sha256sum -c --status '$name.sha256'" </dev/null >/dev/null 2>&1 ||
         { log "ERROR: the copy of $name at $OFFHOST_HOST:$OFFHOST_PATH fails its SHA-256 check"; offhost_discard "$name"; return 1; } ;;
   esac
   log "backup: off-host copy of $name verified at ${REENTRY_OFFHOST_DEST}"
@@ -608,6 +621,7 @@ cmd_restore() {
     [ -n "$name" ] || die 1 "restore $engine/$db: no backup found in $BACKUP_DIR"
   fi
   [ -n "$rdb" ] || rdb=$db
+  [[ $rdb =~ ^[A-Za-z0-9_]+$ ]] || die 2 "restore: the database name '$rdb' may only contain letters, digits and underscores, name another with --database"
   label="restore $engine/$rdb"
   log "$label: using $name"
   need_key_for "$name"
@@ -716,11 +730,13 @@ prune_index() {
   return "$rc"
 }
 
-# off_check <file name>: the copy at the off-host destination passes its SHA-256 file there
+# off_check <file name>: the copy at the off-host destination passes its SHA-256 file there.
+# Every ssh call gets /dev/null as input, prune_index calls these while it reads a list on stdin
+# and ssh would swallow the rest of that list.
 off_check() {
   case "$OFFHOST_KIND" in
     path) [ -f "$OFFHOST_PATH/$1.sha256" ] && (cd "$OFFHOST_PATH" && sha256sum -c --status "$1.sha256" 2>/dev/null) ;;
-    remote) ssh "$OFFHOST_HOST" "cd '$OFFHOST_PATH' && sha256sum -c --status '$1.sha256'" >/dev/null 2>&1 ;;
+    remote) ssh "$OFFHOST_HOST" "cd '$OFFHOST_PATH' && sha256sum -c --status '$1.sha256'" </dev/null >/dev/null 2>&1 ;;
   esac
 }
 
@@ -732,7 +748,7 @@ off_rm() { offhost_discard "$1"; catalog_set_off "$1" none; }
 offhost_list() {
   case "$OFFHOST_KIND" in
     path) [ -d "$OFFHOST_PATH" ] && ls -1 -- "$OFFHOST_PATH" ;;
-    remote) ssh "$OFFHOST_HOST" "ls -1 -- '$OFFHOST_PATH'" ;;
+    remote) ssh "$OFFHOST_HOST" "ls -1 -- '$OFFHOST_PATH'" </dev/null ;;
   esac
 }
 
