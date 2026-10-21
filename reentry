@@ -65,6 +65,116 @@ cmd_backup() {
   log "backup: done"
 }
 
+# keep these in step with compose/docker-compose.yml
+MYSQL_IMAGE=mysql:8.4
+POSTGRES_IMAGE=postgres:16
+
+latest_backup() {
+  { ls -1 "$BACKUP_DIR"/"$1"_"$2"_*.sql.gz 2>/dev/null || true; } | sort | tail -n 1
+}
+
+# sql <engine> <container> <database> <statement>: prints bare values, one per line
+sql() {
+  local engine=$1 container=$2 db=$3 stmt=$4
+  case "$engine" in
+    mysql) docker exec -i "$container" sh -c \
+      'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -h127.0.0.1 -uroot -N -B "$1" -e "$2"' _ "$db" "$stmt" ;;
+    postgres) docker exec -i "$container" psql -U postgres -d "$db" -At -v ON_ERROR_STOP=1 -c "$stmt" ;;
+  esac
+}
+
+# table_counts <engine> <container> <database>: "table=rows" per line, sorted by table
+table_counts() {
+  local engine=$1 container=$2 db=$3 tables t q
+  case "$engine" in
+    mysql) tables="$(sql mysql "$container" "$db" "SELECT table_name FROM information_schema.tables WHERE table_schema='$db' AND table_type='BASE TABLE' ORDER BY 1")" ;;
+    postgres) tables="$(sql postgres "$container" "$db" "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY 1")" ;;
+  esac
+  for t in $tables; do
+    if [ "$engine" = mysql ]; then q="\`$t\`"; else q="\"$t\""; fi
+    printf '%s=%s\n' "$t" "$(sql "$engine" "$container" "$db" "SELECT COUNT(*) FROM $q")"
+  done
+}
+
+wait_ready() {
+  local engine=$1 container=$2 i
+  for i in $(seq 1 60); do
+    # TCP only answers on the final server, not the temporary one the image runs while initialising
+    case "$engine" in
+      mysql) docker exec "$container" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqladmin ping -h127.0.0.1 -uroot --silent' >/dev/null 2>&1 && return 0 ;;
+      postgres) docker exec "$container" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && return 0 ;;
+    esac
+    sleep 2
+  done
+  return 1
+}
+
+# Runs in its own process (see cmd_verify) so set -e and die work normally for one engine.
+cmd_verify_engine() {
+  local engine=$1 db src image file name tmp want got
+  need_docker; load_env
+  case "$engine" in
+    mysql) db=$MYSQL_DATABASE; src=reentry-mysql; image=$MYSQL_IMAGE ;;
+    postgres) db=$POSTGRES_DB; src=reentry-postgres; image=$POSTGRES_IMAGE ;;
+  esac
+  require_running "$src"
+
+  file="$(latest_backup "$engine" "$db")"
+  [ -n "$file" ] || die 1 "verify $engine/$db: no backup found in $BACKUP_DIR"
+  name="$(basename "$file")"
+  log "verify $engine/$db: latest backup is $name"
+
+  [ -f "$file.sha256" ] || die 1 "verify $engine/$db: checksum file missing for $name"
+  (cd "$BACKUP_DIR" && sha256sum -c --status "$name.sha256") || die 1 "verify $engine/$db: SHA-256 mismatch for $name"
+  gzip -t "$file" || die 1 "verify $engine/$db: $name is not valid gzip"
+  log "verify $engine/$db: checksum and gzip ok"
+
+  tmp="reentry-verify-$engine-$$"
+  trap 'docker rm -f "$tmp" >/dev/null 2>&1 || true' EXIT
+  log "verify $engine/$db: starting throwaway container $tmp"
+  case "$engine" in
+    mysql) docker run -d --name "$tmp" -e MYSQL_ROOT_PASSWORD=verify -e "MYSQL_DATABASE=$db" "$image" >/dev/null ;;
+    postgres) docker run -d --name "$tmp" -e POSTGRES_PASSWORD=verify -e "POSTGRES_DB=$db" "$image" >/dev/null ;;
+  esac
+  wait_ready "$engine" "$tmp" || die 1 "verify $engine/$db: throwaway container did not become ready"
+
+  log "verify $engine/$db: restoring $name"
+  case "$engine" in
+    mysql) gzip -dc "$file" | docker exec -i "$tmp" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -h127.0.0.1 -uroot "$1"' _ "$db" ;;
+    postgres) gzip -dc "$file" | docker exec -i "$tmp" psql -U postgres -d "$db" -q -v ON_ERROR_STOP=1 -o /dev/null ;;
+  esac || die 1 "verify $engine/$db: restore failed"
+
+  want="$(table_counts "$engine" "$src" "$db")"
+  got="$(table_counts "$engine" "$tmp" "$db")"
+  [ -n "$want" ] || die 1 "verify $engine/$db: source has no tables"
+  if [ "$want" != "$got" ]; then
+    log "verify $engine/$db: source row counts:"; printf '%s\n' "$want" >&2
+    log "verify $engine/$db: restored row counts:"; printf '%s\n' "$got" >&2
+    die 1 "verify $engine/$db: row counts differ from source"
+  fi
+  log "verify $engine/$db: row counts match source ($(printf '%s' "$want" | tr '\n' ' '))"
+
+  # basic integrity: no order_items row points at a missing order (tied to the sample schema)
+  got="$(sql "$engine" "$tmp" "$db" "SELECT COUNT(*) FROM order_items oi LEFT JOIN orders o ON o.id = oi.order_id WHERE o.id IS NULL")"
+  [ "$got" = 0 ] || die 1 "verify $engine/$db: $got order_items rows have no parent order"
+  if [ "$engine" = mysql ]; then
+    got="$(docker exec "$tmp" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqlcheck -h127.0.0.1 -uroot --check "$1"' _ "$db")" ||
+      die 1 "verify $engine/$db: mysqlcheck failed"
+    ! grep -qvE 'OK$' <<<"$got" || die 1 "verify $engine/$db: mysqlcheck reported problems"
+  fi
+  log "verify $engine/$db: integrity checks ok"
+  log "verify $engine/$db: PASS $name"
+}
+
+cmd_verify() {
+  local engine failed=0
+  for engine in mysql postgres; do
+    "${BASH_SOURCE[0]}" _verify-engine "$engine" || failed=1
+  done
+  [ "$failed" = 0 ] || die 1 "verify: FAILED"
+  log "verify: all backups restore and match the source"
+}
+
 cmd_up() {
   need_docker; load_env
   compose up -d --wait
@@ -81,7 +191,7 @@ usage: reentry <command>
   up       start the MySQL and PostgreSQL containers
   down     stop them and delete their data volumes
   backup   dump both databases to backups/ with SHA-256 checksums
-  verify   (planned)
+  verify   restore the latest backups into throwaway containers and check them
   prune    (planned)
   list     (planned)
 EOF
@@ -91,7 +201,9 @@ case "${1:-}" in
   up)     cmd_up ;;
   down)   cmd_down ;;
   backup) cmd_backup ;;
-  verify|prune|list) die 2 "$1 is not implemented yet" ;;
+  verify) cmd_verify ;;
+  _verify-engine) cmd_verify_engine "${2:?engine}" ;;
+  prune|list) die 2 "$1 is not implemented yet" ;;
   -h|--help|help) usage ;;
   *) usage; exit 2 ;;
 esac
