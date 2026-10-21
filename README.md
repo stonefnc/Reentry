@@ -11,7 +11,7 @@ Status: scaffold only. Every item below is planned until it is marked built.
 | Piece | Status |
 |---|---|
 | `compose/`: one MySQL and one PostgreSQL instance, each seeded with a small fake sample database | written, not yet run (no Docker on the build machine) |
-| `reentry backup`: compressed dumps with a SHA-256 checksum file, named by database and timestamp, written to `backups/` | planned |
+| `reentry backup`: compressed dumps with a SHA-256 checksum file, named by database and timestamp, written to `backups/` | written, not yet run |
 | `reentry verify`: restore the latest backup into a throwaway container, compare row counts per table with the source, run a basic integrity query, exit non-zero on any mismatch | planned |
 | `reentry prune`: retention of 7 daily, 4 weekly and 6 monthly backups, configurable | planned |
 | `reentry list`: show backups with size and checksum state | planned |
@@ -22,6 +22,27 @@ Status: scaffold only. Every item below is planned until it is marked built.
 ## Requirements
 
 Bash, Docker and Docker Compose.
+
+## Usage
+
+```
+cp .env.example .env     # then set the passwords
+./reentry up             # start MySQL and PostgreSQL
+./reentry backup         # dump both databases into backups/
+./reentry down           # stop and delete the data volumes
+```
+
+The Compose file lives in `compose/`, so a bare `docker compose up` from the
+repo root will not find it. `./reentry up` runs
+`docker compose -f compose/docker-compose.yml --env-file .env up -d --wait`.
+Use that command directly if you prefer.
+
+Backups are written as `<engine>_<database>_<UTC timestamp>.sql.gz` with a
+matching `.sha256` file. A dump is written to a `.partial` file and only
+renamed once it is valid gzip, so a failed dump never looks like a backup.
+
+Exit codes: 0 ok, 1 command failed, 2 usage error, 3 prerequisite missing
+(no `.env`, no Docker, container not running).
 
 ## Data and secrets
 
@@ -35,4 +56,6 @@ the corruption test fails verify as expected.
 
 ## Test status
 
-Nothing has been run yet.
+Docker is not installed on the build machine, so no container, dump or
+restore has been run. Only `bash -n reentry` (syntax check) and the usage
+output have been run.

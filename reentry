@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# reentry: backups that prove they restore.
+# Exit codes: 0 ok, 1 command failed, 2 usage error, 3 prerequisite missing
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKUP_DIR="${REENTRY_BACKUP_DIR:-$ROOT/backups}"
+ENV_FILE="$ROOT/.env"
+COMPOSE_FILE="$ROOT/compose/docker-compose.yml"
+
+log() { printf '%s reentry: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
+die() { local code=$1; shift; log "ERROR: $*"; exit "$code"; }
+
+load_env() {
+  [ -f "$ENV_FILE" ] || die 3 ".env not found, copy .env.example to .env and set passwords"
+  set -a; . "$ENV_FILE"; set +a
+  MYSQL_DATABASE="${MYSQL_DATABASE:-shop}"
+  POSTGRES_DB="${POSTGRES_DB:-shop}"
+}
+
+need_docker() {
+  command -v docker >/dev/null 2>&1 || die 3 "docker not found on PATH"
+}
+
+compose() { docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"; }
+
+require_running() {
+  local c=$1
+  [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null || true)" = "true" ] ||
+    die 3 "container $c is not running, start it with: ./reentry up"
+}
+
+# dump_one <engine> <database> <container> <dump command run inside the container>
+dump_one() {
+  local engine=$1 db=$2 container=$3 cmd=$4
+  local stamp name out
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  name="${engine}_${db}_${stamp}.sql.gz"
+  out="$BACKUP_DIR/$name"
+
+  log "backup $engine/$db: dumping from $container"
+  # write to a .partial file so a failed dump never looks like a backup
+  if ! docker exec "$container" sh -c "$cmd" | gzip -9 > "$out.partial"; then
+    rm -f "$out.partial"
+    die 1 "dump of $engine/$db failed"
+  fi
+  gzip -t "$out.partial" || { rm -f "$out.partial"; die 1 "dump of $engine/$db is not valid gzip"; }
+  mv "$out.partial" "$out"
+
+  log "backup $engine/$db: checksumming"
+  (cd "$BACKUP_DIR" && sha256sum "$name" > "$name.sha256")
+  log "backup $engine/$db: ok $name ($(wc -c < "$out" | tr -d ' ') bytes)"
+}
+
+cmd_backup() {
+  need_docker; load_env
+  require_running reentry-mysql
+  require_running reentry-postgres
+  mkdir -p "$BACKUP_DIR"
+  # the password is read inside the container, so it never appears on the host command line
+  dump_one mysql "$MYSQL_DATABASE" reentry-mysql \
+    "MYSQL_PWD=\"\$MYSQL_ROOT_PASSWORD\" mysqldump -uroot --single-transaction --routines --no-tablespaces '$MYSQL_DATABASE'"
+  dump_one postgres "$POSTGRES_DB" reentry-postgres \
+    "pg_dump -U postgres --no-owner '$POSTGRES_DB'"
+  log "backup: done"
+}
+
+cmd_up() {
+  need_docker; load_env
+  compose up -d --wait
+}
+
+cmd_down() {
+  need_docker; load_env
+  compose down -v
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: reentry <command>
+  up       start the MySQL and PostgreSQL containers
+  down     stop them and delete their data volumes
+  backup   dump both databases to backups/ with SHA-256 checksums
+  verify   (planned)
+  prune    (planned)
+  list     (planned)
+EOF
+}
+
+case "${1:-}" in
+  up)     cmd_up ;;
+  down)   cmd_down ;;
+  backup) cmd_backup ;;
+  verify|prune|list) die 2 "$1 is not implemented yet" ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac
