@@ -11,7 +11,8 @@ All sample data is fake. Passwords live in a git-ignored `.env`. The
 
 Docker with Compose, bash 4 or newer, GNU date, `sha256sum`, `gzip` and
 `flock`. That means Linux, WSL or Git Bash. `reentry list` and `reentry prune`
-need no Docker.
+need no Docker. Encryption needs `gpg` or `openssl`, and a remote off-host
+destination needs `rsync` and `ssh`.
 
 ## Usage
 
@@ -21,6 +22,7 @@ cp .env.example .env     # then set the passwords
 ./reentry backup         # dump both databases into backups/
 ./reentry verify         # restore the latest backups and check them
 ./reentry list           # backups with size and checksum state
+./reentry restore mysql  # restore the latest backup into a running container (asks first)
 ./reentry prune          # apply retention (add --dry-run to preview)
 ./reentry down           # stop and delete the data volumes (asks first, or pass --yes)
 ```
@@ -46,6 +48,29 @@ closing comment that a finished dump ends with. Only then is it renamed. A
 failed or interrupted run leaves no backup and no leftovers. One engine
 failing does not stop the other. If rows changed during the dump, no counts
 file is written and `verify` falls back to the live source with a warning.
+
+#### Encryption
+
+Opt-in. Set `REENTRY_ENCRYPT` to `gpg` (symmetric, AES256) or `openssl`
+(`aes-256-cbc` with `pbkdf2`) and `REENTRY_ENCRYPT_KEY_FILE` to a file whose
+first line is the passphrase. The passphrase is read from that file and never
+appears on a command line or in `.env`. Keep the file off the backup volume and
+off the off-host destination, restrict it with `chmod 600`, and keep a copy
+somewhere safe. Without it the backups cannot be read.
+
+With encryption on, the finished and checked dump is encrypted and stored as
+`<engine>_<db>_<UTC timestamp>.sql.gz.enc`. The plaintext is removed, and a
+failure leaves no plaintext behind. The `.sha256` file covers the file as
+stored, so `list`, `prune` and the off-host check work without the key.
+`verify` and `restore` decrypt on the fly and tell `gpg` and `openssl` files
+apart by their header, so they only need the key file. A missing or empty key
+file stops the run before anything is dumped or restored (exit 3), an unset
+`REENTRY_ENCRYPT_KEY_FILE` or unknown tool is a bad setting (exit 2), and there
+is never a fallback to a plaintext backup. A wrong key fails `verify` and
+`restore` with exit 1. Encrypted and plaintext backups can sit in the same
+folder. `.counts` files are not encrypted and hold table names and row counts.
+This protects backups at rest. It does not hide data from anyone who holds the
+key file, and the gpg and openssl tools are used as installed on your system.
 
 #### Off-host copy
 
@@ -84,6 +109,41 @@ integrity checks:
 The throwaway container is removed on exit. `verify` exits non-zero if either
 engine fails.
 
+### restore
+
+```
+./reentry restore <mysql|postgres> [--backup FILE] [--target CONTAINER] [--database NAME] [--yes]
+```
+
+Loads a backup into a database on a running container. `verify` only ever
+writes into a throwaway container it starts and removes itself. `restore` is
+the command for real recovery, so it writes where you point it.
+
+- The backup is the latest one for that engine, or the file named with
+  `--backup` (a bare file name from `backups/`, for the same engine).
+- The target container defaults to the sample source container
+  (`reentry-mysql` or `reentry-postgres`). Use `--target` for any other running
+  container. It must follow the same conventions as the sample containers: a
+  MySQL container with `MYSQL_ROOT_PASSWORD` set, or a PostgreSQL container
+  with the `postgres` user and trust access from inside the container.
+- The database name defaults to the one in the backup file name. `--database`
+  restores into another name. A database that does not exist is created.
+- Before anything is written the SHA-256 file and gzip integrity are checked,
+  and a backup that fails is refused.
+- Safety: unless the target is a `verify` throwaway container, `restore` shows
+  the backup, database and container and asks you to type `yes`. With no
+  terminal it refuses and exits 2 unless you pass `--yes`, in line with
+  `down --yes`. On MySQL, tables with the same names in an existing database
+  are replaced. On PostgreSQL the load runs as one transaction and is refused if
+  the database already has tables, so restore into an empty database.
+- After the load, row counts are compared with the `.counts` file. A mismatch
+  exits 1. Without a counts file the check is skipped with a warning.
+
+`restore` exits 0 on success, 1 if a check fails, the load fails or you answer
+no, 2 for a usage error or a missing `--yes`, and 3 if Docker or the target
+container is not available. A failed MySQL load can leave the database partly
+loaded, because MySQL cannot roll back the statements in a dump.
+
 ### prune
 
 Works on each engine and database separately. Keeps the newest backup of each
@@ -101,7 +161,7 @@ also removes orphan sidecars and leftover `.partial` files.
 settings from `.env`, and it never runs the file as shell code. A value
 already in the environment wins. Quote values that contain `$` with single
 quotes. Inline comments are not supported. `REENTRY_BACKUP_DIR` moves the
-backup folder, and one `backup`, `verify` or `prune` runs at a time (a lock
+backup folder, and one `backup`, `verify`, `restore` or `prune` runs at a time (a lock
 file in that folder).
 
 ### Exit codes
@@ -110,7 +170,7 @@ file in that folder).
 |---|---|
 | 0 | ok |
 | 1 | the command failed, a check failed (an off-host copy that fails counts), or `list` found no backups or a bad checksum |
-| 2 | usage error or bad setting |
+| 2 | usage error or bad setting (for `restore`, also a missing `--yes` when there is no terminal) |
 | 3 | prerequisite missing (Docker, a tool, or a container not running) |
 
 When both engines run, the worst code is returned. Every step writes one log
@@ -130,6 +190,8 @@ written to be followed under pressure.
 - The checksum file sits next to the backup. It detects damage, not
   tampering. Record hashes somewhere else at backup time.
 - Dumps hold tables and data, not database users or grants.
+- The encryption passphrase file is not backed up or rotated by Reentry.
+  Changing it makes older backups unreadable with the new file.
 - Single-database dumps and the sample schema only.
 
 ## Status
@@ -138,6 +200,8 @@ written to be followed under pressure.
 |---|---|
 | Compose with seeded MySQL and PostgreSQL | written, not run (no Docker on the build machine) |
 | `backup`, `verify` | written, logic tested against a fake `docker`, not run against real Docker |
+| `restore` | written, logic and the confirmation prompt tested against a fake `docker`, not run against real Docker |
+| Encryption (`gpg`, `openssl`) | written, logic tested against a fake `docker` with the real `gpg` and `openssl`, not run against real Docker |
 | Off-host copy (folder and rsync/ssh) | written, logic tested against a fake `docker`, `rsync` and `ssh`, not run against real Docker, a real ssh host or a real share |
 | `prune`, `list` | built and tested, no Docker needed |
 | Runbook | written, restore commands not run |
@@ -151,7 +215,7 @@ the corruption test fails verify as expected. That has not been shown yet.
 | Command | Needs Docker | Result so far |
 |---|---|---|
 | `bash test/prune.sh` | no | 18 checks passed under WSL bash |
-| `bash test/fake.sh` | no | 43 checks passed under WSL bash |
+| `bash test/fake.sh` | no | 118 checks passed under WSL bash (uses the installed `gpg` and `openssl`, and skips a tool that is missing) |
 | `bash test/e2e.sh` | yes | not run, only its syntax and the Docker-missing exit were checked |
 
 `test/e2e.sh` starts the sample databases if needed, takes a real backup in a

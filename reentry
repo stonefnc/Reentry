@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 SELF="$ROOT/reentry"
 ENV_FILE="$ROOT/.env"
 COMPOSE_FILE="$ROOT/compose/docker-compose.yml"
-BACKUP_RE='^(.+)_([0-9]{8}T[0-9]{6}Z)\.sql\.gz$'
+BACKUP_RE='^(.+)_([0-9]{8}T[0-9]{6}Z)\.sql\.gz(\.enc)?$'
 
 log() { printf '%s reentry: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 die() { local code=$1; shift; log "ERROR: $*"; exit "$code"; }
@@ -15,7 +15,7 @@ die() { local code=$1; shift; log "ERROR: $*"; exit "$code"; }
 # Leftovers of the step in flight, removed on exit, Ctrl-C or kill.
 CLEAN_BASE="" CLEAN_CONTAINER="" CLEAN_OFF=()
 cleanup() {
-  [ -z "$CLEAN_BASE" ] || rm -f -- "$CLEAN_BASE.partial" "$CLEAN_BASE.counts" "$CLEAN_BASE.sha256"
+  [ -z "$CLEAN_BASE" ] || rm -f -- "$CLEAN_BASE.partial" "$CLEAN_BASE.plain.partial" "$CLEAN_BASE.counts" "$CLEAN_BASE.sha256"
   [ "${#CLEAN_OFF[@]}" -eq 0 ] || rm -f -- "${CLEAN_OFF[@]}"
   [ -z "$CLEAN_CONTAINER" ] || docker rm -f "$CLEAN_CONTAINER" >/dev/null 2>&1 || true
 }
@@ -123,7 +123,7 @@ dump_to() {
 # backup_index: "key<TAB>file" for every backup, newest first within each key (engine_database)
 backup_index() {
   local f n
-  for f in "$BACKUP_DIR"/*.sql.gz; do
+  for f in "$BACKUP_DIR"/*.sql.gz "$BACKUP_DIR"/*.sql.gz.enc; do
     [ -e "$f" ] || continue
     n="${f##*/}"
     [[ $n =~ $BACKUP_RE ]] || continue
@@ -142,6 +142,57 @@ latest_backup() {
 # checksum_ok <file name>: the .sha256 file exists and every file it lists matches
 checksum_ok() {
   [ -f "$BACKUP_DIR/$1.sha256" ] && (cd "$BACKUP_DIR" && sha256sum -c --status "$1.sha256" 2>/dev/null)
+}
+
+# Optional encryption at rest. REENTRY_ENCRYPT is gpg or openssl and REENTRY_ENCRYPT_KEY_FILE
+# names a file whose first line is the passphrase. The passphrase is never put on a command line.
+ENC_TOOL=""
+need_key() {
+  local k="${REENTRY_ENCRYPT_KEY_FILE:-}"
+  [ -n "$k" ] || die 2 "REENTRY_ENCRYPT_KEY_FILE must name the file that holds the encryption passphrase"
+  { [ -f "$k" ] && [ -r "$k" ] && [ -s "$k" ]; } || die 3 "encryption key file $k is missing, unreadable or empty"
+}
+
+# need_key_for <file name>: an encrypted backup needs the key before anything else is tried
+need_key_for() { case "$1" in *.enc) need_key ;; esac; }
+
+encrypt_setup() {
+  ENC_TOOL="${REENTRY_ENCRYPT:-}"
+  case "$ENC_TOOL" in
+    "") return 0 ;;
+    gpg|openssl) ;;
+    *) die 2 "REENTRY_ENCRYPT must be gpg or openssl, got '$ENC_TOOL'" ;;
+  esac
+  command -v "$ENC_TOOL" >/dev/null 2>&1 || die 3 "$ENC_TOOL not found on PATH, it is needed for REENTRY_ENCRYPT=$ENC_TOOL"
+  need_key
+  if [ -n "$(find "$REENTRY_ENCRYPT_KEY_FILE" -maxdepth 0 -perm /077 2>/dev/null)" ]; then
+    log "WARN $REENTRY_ENCRYPT_KEY_FILE can be read by other users, restrict it with chmod 600"
+  fi
+}
+
+# encrypt_stream: encrypts stdin to stdout with the configured tool
+encrypt_stream() {
+  case "$ENC_TOOL" in
+    openssl) openssl enc -aes-256-cbc -pbkdf2 -salt -pass "file:$REENTRY_ENCRYPT_KEY_FILE" ;;
+    gpg) gpg --batch --quiet --yes --pinentry-mode loopback --passphrase-file "$REENTRY_ENCRYPT_KEY_FILE" \
+      --symmetric --cipher-algo AES256 --compress-algo none -o - ;;
+  esac
+}
+
+# read_backup <file name>: the gzip stream of a backup on stdout, decrypted if it is encrypted.
+# The tool is told apart by the file header, so it does not depend on the current setting.
+read_backup() {
+  local f="$BACKUP_DIR/$1"
+  case "$1" in
+    *.enc)
+      need_key
+      if head -c 8 -- "$f" | grep -aqx 'Salted__'; then
+        openssl enc -d -aes-256-cbc -pbkdf2 -pass "file:$REENTRY_ENCRYPT_KEY_FILE" -in "$f"
+      else
+        gpg --batch --quiet --pinentry-mode loopback --passphrase-file "$REENTRY_ENCRYPT_KEY_FILE" -d "$f"
+      fi ;;
+    *) cat -- "$f" ;;
+  esac
 }
 
 # offhost_setup: reads REENTRY_OFFHOST_DEST and sets OFFHOST_KIND (none, path or remote),
@@ -206,29 +257,36 @@ offhost_copy() {
 
 # Runs in its own process (see cmd_backup) so one engine failing never stops the other.
 cmd_backup_engine() {
-  local engine=$1 db src stamp name base marker before after after_tail hash manifest=0
-  need_docker; load_env; engine_setup "$engine"; offhost_setup
+  local engine=$1 db src stamp name base plain marker before after after_tail hash manifest=0
+  need_docker; load_env; engine_setup "$engine"; encrypt_setup; offhost_setup
   require_running "$src"
   case "$engine" in mysql) marker='Dump completed' ;; postgres) marker='dump complete' ;; esac
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  name="${engine}_${db}_${stamp}.sql.gz"
+  name="${engine}_${db}_${stamp}.sql.gz${ENC_TOOL:+.enc}"
   base="$BACKUP_DIR/$name"
+  plain="$base.partial"; [ -z "$ENC_TOOL" ] || plain="$base.plain.partial"
   CLEAN_BASE="$base"
 
   before="$(table_counts "$engine" "$src" "$db")" || die 1 "backup $engine/$db: could not read table counts"
   log "backup $engine/$db: dumping from $src"
-  dump_to "$engine" "$src" "$db" | gzip -9 > "$base.partial" || die 1 "backup $engine/$db: dump failed"
+  dump_to "$engine" "$src" "$db" | gzip -9 > "$plain" || die 1 "backup $engine/$db: dump failed"
   after="$(table_counts "$engine" "$src" "$db")" || die 1 "backup $engine/$db: could not read table counts"
 
-  gzip -t "$base.partial" || die 1 "backup $engine/$db: dump is not valid gzip"
+  gzip -t "$plain" || die 1 "backup $engine/$db: dump is not valid gzip"
   # gzip -t cannot tell a finished dump from a cut-off one, so look for the dump's closing comment
-  after_tail="$(gzip -dc "$base.partial" | tail -n 10)" || die 1 "backup $engine/$db: could not read the dump back"
+  after_tail="$(gzip -dc "$plain" | tail -n 10)" || die 1 "backup $engine/$db: could not read the dump back"
   grep -q "$marker" <<<"$after_tail" || die 1 "backup $engine/$db: dump looks incomplete (no '$marker' trailer)"
 
   if [ -n "$before" ] && [ "$before" = "$after" ]; then
     printf '%s\n' "$before" > "$base.counts"; manifest=1
   else
     log "backup $engine/$db: WARN source changed during the dump, no row count manifest written, verify will compare with the live source"
+  fi
+
+  # the checksum covers the file as stored, so it can be checked without the key
+  if [ -n "$ENC_TOOL" ]; then
+    encrypt_stream < "$plain" > "$base.partial" || die 1 "backup $engine/$db: encryption with $ENC_TOOL failed"
+    rm -f -- "$plain"
   fi
 
   # sidecar first, dump last: a crash leaves at worst an orphan sidecar, never a backup without one
@@ -239,7 +297,7 @@ cmd_backup_engine() {
   } > "$base.sha256"
   mv "$base.partial" "$base"
   CLEAN_BASE=""
-  log "backup $engine/$db: ok $name ($(wc -c < "$base" | tr -d ' ') bytes, row counts $([ "$manifest" = 1 ] && echo recorded || echo not recorded))"
+  log "backup $engine/$db: ok $name ($(wc -c < "$base" | tr -d ' ') bytes, $([ -n "$ENC_TOOL" ] && echo "encrypted with $ENC_TOOL" || echo plaintext), row counts $([ "$manifest" = 1 ] && echo recorded || echo not recorded))"
   offhost_copy "$name" || die 1 "backup $engine/$db: off-host copy FAILED, the local backup $name is kept"
 }
 
@@ -252,7 +310,7 @@ run_engines() { # run_engines <internal command>: runs both engines, returns the
 }
 
 cmd_backup() {
-  offhost_setup
+  encrypt_setup; offhost_setup
   take_lock
   run_engines _backup-engine || die $? "backup: FAILED, see the errors above"
   log "backup: done"
@@ -303,12 +361,12 @@ integrity_check() {
 restore_into() {
   local engine=$1 c=$2 db=$3 name=$4 single=${5:-}
   case "$engine" in
-    mysql) gzip -dc "$BACKUP_DIR/$name" | docker exec -i "$c" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -h127.0.0.1 -uroot "$1"' _ "$db" ;;
+    mysql) read_backup "$name" | gzip -dc | docker exec -i "$c" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -h127.0.0.1 -uroot "$1"' _ "$db" ;;
     postgres)
       if [ "$single" = single ]; then
-        gzip -dc "$BACKUP_DIR/$name" | docker exec -i "$c" psql -U postgres -d "$db" -q -v ON_ERROR_STOP=1 -1 -f - -o /dev/null
+        read_backup "$name" | gzip -dc | docker exec -i "$c" psql -U postgres -d "$db" -q -v ON_ERROR_STOP=1 -1 -f - -o /dev/null
       else
-        gzip -dc "$BACKUP_DIR/$name" | docker exec -i "$c" psql -U postgres -d "$db" -q -v ON_ERROR_STOP=1 -o /dev/null
+        read_backup "$name" | gzip -dc | docker exec -i "$c" psql -U postgres -d "$db" -q -v ON_ERROR_STOP=1 -o /dev/null
       fi ;;
   esac
 }
@@ -322,8 +380,9 @@ cmd_verify_engine() {
   name="$(latest_backup "$engine" "$db")"
   [ -n "$name" ] || die 1 "verify $engine/$db: no backup found in $BACKUP_DIR"
   log "verify $engine/$db: latest backup is $name"
+  need_key_for "$name"
   checksum_ok "$name" || die 1 "verify $engine/$db: checksum file missing or SHA-256 mismatch for $name"
-  gzip -t "$BACKUP_DIR/$name" || die 1 "verify $engine/$db: $name is not valid gzip"
+  read_backup "$name" | gzip -t || die 1 "verify $engine/$db: $name cannot be decrypted or is not valid gzip"
   log "verify $engine/$db: checksum and gzip ok"
 
   # same image as the source, no network, removed when the process exits
@@ -423,8 +482,9 @@ cmd_restore() {
   [ -n "$rdb" ] || rdb=$db
   label="restore $engine/$rdb"
   log "$label: using $name"
+  need_key_for "$name"
   checksum_ok "$name" || die 1 "$label: checksum file missing or SHA-256 mismatch for $name"
-  gzip -t "$BACKUP_DIR/$name" || die 1 "$label: $name is not valid gzip"
+  read_backup "$name" | gzip -t || die 1 "$label: $name cannot be decrypted or is not valid gzip"
   require_running "$target"
 
   existing=""
@@ -499,7 +559,7 @@ prune_group() {
 # Removes sidecars with no backup and leftover .partial files. Safe because the lock is held.
 prune_orphans() {
   local dry=$1 f
-  for f in "$BACKUP_DIR"/*.sql.gz.sha256 "$BACKUP_DIR"/*.sql.gz.counts "$BACKUP_DIR"/*.sql.gz.partial; do
+  for f in "$BACKUP_DIR"/*.sql.gz{,.enc}.{sha256,counts,partial} "$BACKUP_DIR"/*.sql.gz{,.enc}.plain.partial; do
     [ -e "$f" ] || continue
     case "$f" in *.partial) ;; *) [ ! -e "${f%.*}" ] || continue ;; esac
     if [ "$dry" = 1 ]; then log "prune: would delete orphan ${f##*/}"; else rm -f -- "$f"; log "prune: deleted orphan ${f##*/}"; fi

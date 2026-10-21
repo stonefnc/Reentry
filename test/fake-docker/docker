@@ -3,11 +3,14 @@
 # It answers the exact calls reentry makes with canned data. It proves the script logic only.
 # Knobs (environment): FAKE_LOG, FAKE_DOWN=<container>, FAKE_FAIL_DUMP=1, FAKE_TRUNCATE=1,
 # FAKE_DROP_ROW=1 (restored copy loses a row), FAKE_DRIFT=1 (live source gains a row).
+# A container named reentry-empty-* has no database and no tables until it is created.
+# Restores and CREATE DATABASE calls are written to FAKE_LOG as "load <container>" and "create <container>".
 all="$*"
 case "$1" in
   inspect)
     case "$all" in
       *State.Running*) [ "${FAKE_DOWN:-}" = "${*: -1}" ] && echo false || echo true ;;
+      *reentry.verify*) case "${*: -1}" in reentry-verify-*) echo 1 ;; *) echo ;; esac ;;
       *) echo mysql:8.4 ;;
     esac
     exit 0 ;;
@@ -40,10 +43,15 @@ case "$all" in
       case "$all" in *mysqldump*) echo "-- Dump completed on 2026-01-01" ;; *) echo "-- PostgreSQL database dump complete" ;; esac
     fi ;;
   *mysqladmin*|*pg_isready*) exit 0 ;;
+  *"CREATE DATABASE"*) echo "create $container" >> "${FAKE_LOG:-/dev/null}"; exit 0 ;;
+  *schemata*|*pg_database*)
+    case "$container" in reentry-empty-*) grep -qx "create $container" "${FAKE_LOG:-/dev/null}" 2>/dev/null && echo 1 || echo 0 ;; *) echo 1 ;; esac ;;
   *mysqlcheck*) printf 'shop.customers  OK\nshop.orders  OK\n' ;;
-  *information_schema*|*pg_tables*) printf 'customers\nproducts\norders\norder_items\n' ;;
+  *information_schema*|*pg_tables*)
+    case "$container" in reentry-empty-*) grep -qx "load $container" "${FAKE_LOG:-/dev/null}" 2>/dev/null || exit 0 ;; esac
+    printf 'customers\nproducts\norders\norder_items\n' ;;
   *pg_constraint*|*"LEFT JOIN"*) echo 0 ;;
   *"SELECT COUNT(*) FROM "*)
     t="${all##*FROM }"; t="${t//\`/}"; t="${t//\"/}"; count_of "$t" ;;
-  *) cat > /dev/null ;; # a restore: read the dump from stdin
+  *) cat > /dev/null; echo "load $container" >> "${FAKE_LOG:-/dev/null}" ;; # a restore: read the dump from stdin
 esac

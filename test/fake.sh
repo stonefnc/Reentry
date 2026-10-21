@@ -178,6 +178,61 @@ fresh n
 run restore mysql --yes
 check "restore with no backups exits 1" [ "$rc" = 1 ]
 
+# encryption at rest
+printf 'correct horse battery staple\n' > "$tmp/key"; chmod 600 "$tmp/key"
+printf 'a different passphrase\n' > "$tmp/wrongkey"; chmod 600 "$tmp/wrongkey"
+mkdir -p "$tmp/gnupg"; chmod 700 "$tmp/gnupg"; export GNUPGHOME="$tmp/gnupg"
+for tool in openssl gpg; do
+  if ! command -v "$tool" >/dev/null 2>&1; then echo "skip $tool tests, $tool not installed"; continue; fi
+  fresh "enc-$tool"; off="$tmp/off-$tool"; mkdir -p "$off"
+  REENTRY_ENCRYPT=$tool REENTRY_ENCRYPT_KEY_FILE="$tmp/key" REENTRY_OFFHOST_DEST="$off" run backup
+  check "$tool: encrypted backup exits 0" [ "$rc" = 0 ]
+  check "$tool: the log says the backup is encrypted" has "encrypted with $tool"
+  check "$tool: both dumps are stored as .sql.gz.enc" [ "$(files '\.sql\.gz\.enc$')" = 2 ]
+  check "$tool: no plaintext dump or partial file is left" [ "$(files '\.sql\.gz$')$(files partial)" = 00 ]
+  enc_my="$(ls "$REENTRY_BACKUP_DIR" | grep '^mysql.*\.sql\.gz\.enc$')"
+  check "$tool: the stored file is not a gzip stream" bash -c "! gzip -t '$REENTRY_BACKUP_DIR/$enc_my'"
+  check "$tool: the checksum covers the stored file and passes without the key" bash -c "cd '$REENTRY_BACKUP_DIR' && sha256sum -c --status '$enc_my.sha256'"
+  check "$tool: the encrypted backups are copied off-host" [ "$(ls "$off" | grep -c '\.sql\.gz\.enc$')" = 2 ]
+
+  REENTRY_ENCRYPT_KEY_FILE="$tmp/key" run verify
+  check "$tool: verify decrypts and passes (no REENTRY_ENCRYPT needed)" [ "$rc" = 0 ]
+  check "$tool: verify reports PASS for both engines" [ "$(grep -c PASS "$tmp/out")" = 2 ]
+  : > "$FAKE_LOG"
+  REENTRY_ENCRYPT_KEY_FILE="$tmp/key" run restore mysql --target reentry-empty-enc --yes
+  check "$tool: restore decrypts and loads" [ "$rc" = 0 ]
+  check "$tool: the decrypted dump reached the target" grep -qx "load reentry-empty-enc" "$FAKE_LOG"
+
+  REENTRY_ENCRYPT_KEY_FILE="$tmp/wrongkey" run verify
+  check "$tool: verify with the wrong key exits 1" [ "$rc" = 1 ]
+  check "$tool: the wrong key is reported as a decrypt problem" has "cannot be decrypted"
+  run verify
+  check "$tool: verify without a key setting exits 2" [ "$rc" = 2 ]
+  check "$tool: the missing key is named" has "REENTRY_ENCRYPT_KEY_FILE"
+  REENTRY_ENCRYPT_KEY_FILE="$tmp/no-such-key" run restore mysql --target reentry-empty-x --yes
+  check "$tool: restore with a missing key file exits 3" [ "$rc" = 3 ]
+  run list
+  check "$tool: list works without the key" [ "$rc" = 0 ]
+  run prune
+  check "$tool: prune handles encrypted backups and keeps the newest" [ "$rc" = 0 ] 
+  check "$tool: both encrypted backups are still there after prune" [ "$(files '\.sql\.gz\.enc$')" = 2 ]
+done
+
+fresh o
+REENTRY_ENCRYPT=openssl run backup
+check "encryption on with no key setting exits 2" [ "$rc" = 2 ]
+check "and no backup is taken" [ ! -e "$REENTRY_BACKUP_DIR" ] 
+fresh p
+REENTRY_ENCRYPT=openssl REENTRY_ENCRYPT_KEY_FILE="$tmp/no-such-key" run backup
+check "encryption on with a missing key file exits 3" [ "$rc" = 3 ]
+check "no plaintext backup is written as a fallback" [ "$(files '\.sql\.gz')" = 0 ]
+fresh q
+REENTRY_ENCRYPT=rot13 REENTRY_ENCRYPT_KEY_FILE="$tmp/key" run backup
+check "an unknown encryption tool exits 2" [ "$rc" = 2 ]
+: > "$tmp/empty-key"
+REENTRY_ENCRYPT=openssl REENTRY_ENCRYPT_KEY_FILE="$tmp/empty-key" run backup
+check "an empty key file exits 3" [ "$rc" = 3 ]
+
 fresh e
 check "list exits 1 on an empty folder" bash -c "! '$ROOT/reentry' list"
 

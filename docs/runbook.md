@@ -106,6 +106,41 @@ sha256sum -c mysql_shop_20260101T000000Z.sql.gz.sha256
 
 It must print `OK`. If it does not, stop and pick a different backup.
 
+If the backups end in `.enc` they are encrypted. Get the passphrase file from
+wherever it is kept (not from the backup storage) and put its path in
+`REENTRY_ENCRYPT_KEY_FILE`. `list`, the checksum check and `reentry restore` work
+with the file as it is. For the manual commands below, decrypt first. For an
+`openssl` file:
+
+```
+openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/path/to/reentry.key -in FILE.sql.gz.enc -out FILE.sql.gz
+```
+
+For a `gpg` file:
+
+```
+gpg --batch --pinentry-mode loopback --passphrase-file /path/to/reentry.key -d -o FILE.sql.gz FILE.sql.gz.enc
+```
+
+Then use `FILE.sql.gz` in the commands below. Delete the decrypted file when you
+are done. These two commands are the documented form and were not run by hand.
+
+If the clean host runs the database in Docker, `./reentry restore` does the
+load and the row count check for you. Copy the three files into the backup
+folder, then run this for MySQL or PostgreSQL. It asks you to type `yes`
+before it writes to the container:
+
+```
+./reentry restore mysql --backup mysql_shop_20260101T000000Z.sql.gz --target my-clean-mysql
+./reentry restore postgres --backup postgres_shop_20260101T000000Z.sql.gz --target my-clean-postgres
+```
+
+Pass `--yes` only when you are sure of the target. It checks the checksum file
+first, so the manual check above is already done, and it refuses a PostgreSQL
+database that already has tables. This command has not been run against real
+Docker yet, so on a real incident read its output carefully. The plain commands
+below work without Reentry.
+
 Create the empty database, then load the dump.
 
 MySQL:
