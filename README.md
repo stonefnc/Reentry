@@ -2,26 +2,16 @@
 
 Backups that prove they restore. Reentry takes logical dumps of a MySQL and a
 PostgreSQL database, checksums them, and restores the latest one into a
-throwaway container to check it against the source. Everything runs in Docker.
+throwaway container to check it. Everything runs in Docker.
 
-Status: scaffold only. Every item below is planned until it is marked built.
-
-## Spec
-
-| Piece | Status |
-|---|---|
-| `compose/`: one MySQL and one PostgreSQL instance, each seeded with a small fake sample database | written, not yet run (no Docker on the build machine) |
-| `reentry backup`: compressed dumps with a SHA-256 checksum file, named by database and timestamp, written to `backups/` | written, not yet run |
-| `reentry verify`: restore the latest backup into a throwaway container, compare row counts per table with the source, run a basic integrity query, exit non-zero on any mismatch | written, restore path not yet run |
-| `reentry prune`: retention of 7 daily, 4 weekly and 6 monthly backups, configurable | built, tested without Docker |
-| `reentry list`: show backups with size and checksum state | built, tested without Docker |
-| Exit codes and one log line per step | planned |
-| [`docs/runbook.md`](docs/runbook.md): generic ransomware recovery runbook | written, restore commands not run (no Docker) |
-| `test/e2e.sh`: backup, corrupt a copy, confirm verify catches it | planned |
+All sample data is fake. Passwords live in a git-ignored `.env`. The
+`backups/` folder is git-ignored and must never be committed.
 
 ## Requirements
 
-Bash, Docker and Docker Compose.
+Docker with Compose, bash 4 or newer, GNU date, `sha256sum`, `gzip` and
+`flock`. That means Linux, WSL or Git Bash. `reentry list` and `reentry prune`
+need no Docker.
 
 ## Usage
 
@@ -32,55 +22,116 @@ cp .env.example .env     # then set the passwords
 ./reentry verify         # restore the latest backups and check them
 ./reentry list           # backups with size and checksum state
 ./reentry prune          # apply retention (add --dry-run to preview)
-./reentry down           # stop and delete the data volumes
+./reentry down           # stop and delete the data volumes (asks first, or pass --yes)
 ```
-
-`prune` works on each engine and database separately. It keeps the newest
-backup of each of the last 7 days, 4 ISO weeks and 6 months that have one,
-and deletes the rest along with their `.sha256` files. Set
-`REENTRY_KEEP_DAILY`, `REENTRY_KEEP_WEEKLY` and `REENTRY_KEEP_MONTHLY` in
-`.env` to change the numbers. The newest backup of a group is never deleted,
-even if every limit is 0. It needs bash 4 and GNU date (Linux, WSL, Git Bash).
-
-`verify` handles each engine in turn. For the latest backup it checks the
-SHA-256 file and gzip integrity, starts a throwaway container with no
-published ports, restores the dump into it, compares the row count of every
-table with the live source, and runs integrity checks: no `order_items` row
-without a parent order (written for the sample schema, change it for your own),
-plus `mysqlcheck` on MySQL. It removes the throwaway container on exit and
-exits 1 if either engine fails. The source is read live, so run `verify`
-soon after `backup`: rows written in between show up as a count mismatch.
-Set `REENTRY_BACKUP_DIR` to point it at a different backup folder.
 
 The Compose file lives in `compose/`, so a bare `docker compose up` from the
 repo root will not find it. `./reentry up` runs
 `docker compose -f compose/docker-compose.yml --env-file .env up -d --wait`.
 Use that command directly if you prefer.
 
-Backups are written as `<engine>_<database>_<UTC timestamp>.sql.gz` with a
-matching `.sha256` file. A dump is written to a `.partial` file and only
-renamed once it is valid gzip, so a failed dump never looks like a backup.
+### backup
 
-Exit codes: 0 ok, 1 command failed, 2 usage error, 3 prerequisite missing
-(no `.env`, no Docker, container not running).
+Dumps each database with `mysqldump` and `pg_dump` inside its container, so
+passwords never appear on the host command line. Files go to `backups/`:
 
-## Data and secrets
+| File | Content |
+|---|---|
+| `<engine>_<db>_<UTC timestamp>.sql.gz` | the compressed dump |
+| `<same name>.sha256` | SHA-256 of the dump and of the counts file |
+| `<same name>.counts` | `table=rows` per table, read before and after the dump |
 
-All sample data is fake. Credentials live in a git-ignored `.env`. The
-`backups/` folder is git-ignored and must never be committed.
+A dump is written to a `.partial` file, then checked: valid gzip and the
+closing comment that a finished dump ends with. Only then is it renamed. A
+failed or interrupted run leaves no backup and no leftovers. One engine
+failing does not stop the other. If rows changed during the dump, no counts
+file is written and `verify` falls back to the live source with a warning.
 
-## Done when
+### verify
 
-`docker compose up -d && ./reentry backup && ./reentry verify` succeeds, and
-the corruption test fails verify as expected.
+For each engine, takes the latest backup and checks the SHA-256 file and gzip
+integrity. It then starts a throwaway container from the same image as the
+source, with no network, restores the dump into it and compares the row count
+of every table with the `.counts` file recorded at backup time. Then it runs
+integrity checks:
 
-## Test status
+- A query that must return 0. By default, no `order_items` row without a
+  parent `orders` row, which fits the sample schema. Set
+  `REENTRY_INTEGRITY_SQL` in `.env` to use your own query. If the sample
+  tables are absent and no query is set, this check is skipped with a warning.
+- `mysqlcheck` on MySQL, and a check that all constraints are valid on
+  PostgreSQL.
 
-Docker is not installed on the build machine, so no container, dump or
-restore has been run. Run so far: `bash -n reentry`, the usage output, and
-`verify` against a stub `docker` command, which confirmed the checksum
-mismatch and no-backup-found paths exit 1. The restore, row count and
-integrity steps are untested.
+The throwaway container is removed on exit. `verify` exits non-zero if either
+engine fails.
 
-`bash test/prune.sh` covers prune and list on fake backup files and needs no
-Docker. It passed (13 checks) under WSL bash.
+### prune
+
+Works on each engine and database separately. Keeps the newest backup of each
+of the last 7 days, 4 ISO weeks and 6 months that have one, and deletes the
+rest with their `.sha256` and `.counts` files. Set `REENTRY_KEEP_DAILY`,
+`REENTRY_KEEP_WEEKLY` and `REENTRY_KEEP_MONTHLY` in `.env` to change the
+numbers. The newest backup of a group is never deleted, even if every limit is
+0. If the newest backup of a group fails its checksum, that group is left
+alone and prune exits 1, so a corrupt backup cannot push good ones out. Prune
+also removes orphan sidecars and leftover `.partial` files.
+
+### Settings
+
+`reentry` reads only `MYSQL_DATABASE`, `POSTGRES_DB` and the `REENTRY_*`
+settings from `.env`, and it never runs the file as shell code. A value
+already in the environment wins. Quote values that contain `$` with single
+quotes. Inline comments are not supported. `REENTRY_BACKUP_DIR` moves the
+backup folder, and one `backup`, `verify` or `prune` runs at a time (a lock
+file in that folder).
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ok |
+| 1 | the command failed, a check failed, or `list` found no backups or a bad checksum |
+| 2 | usage error or bad setting |
+| 3 | prerequisite missing (Docker, a tool, or a container not running) |
+
+When both engines run, the worst code is returned. Every step writes one log
+line to stderr.
+
+## Recovery
+
+[`docs/runbook.md`](docs/runbook.md) is a generic ransomware recovery runbook
+written to be followed under pressure.
+
+## Limits
+
+- Backups stay in a local folder. Copying them somewhere the database host
+  cannot write to is planned and not built. Until then, do it yourself.
+- The checksum file sits next to the backup. It detects damage, not
+  tampering. Record hashes somewhere else at backup time.
+- Dumps hold tables and data, not database users or grants.
+- Single-database dumps and the sample schema only.
+
+## Status
+
+| Piece | State |
+|---|---|
+| Compose with seeded MySQL and PostgreSQL | written, not run (no Docker on the build machine) |
+| `backup`, `verify` | written, logic tested against a fake `docker`, not run against real Docker |
+| `prune`, `list` | built and tested, no Docker needed |
+| Runbook | written, restore commands not run |
+| End-to-end test (`test/e2e.sh`) | planned |
+
+Done when `./reentry up && ./reentry backup && ./reentry verify` succeeds and
+the corruption test fails verify as expected. That has not been shown yet.
+
+## Tests
+
+| Command | Needs Docker | Result so far |
+|---|---|---|
+| `bash test/prune.sh` | no | 18 checks passed under WSL bash |
+| `bash test/fake.sh` | no | 21 checks passed under WSL bash |
+
+`test/fake.sh` uses a stand-in `docker` command (`test/fake-docker/`) that
+returns canned dumps and counts. It checks the script's own logic: file
+handling, manifests, exit codes, cleanup and failure paths. It cannot show that
+a real dump restores. No real MySQL or PostgreSQL has been run.

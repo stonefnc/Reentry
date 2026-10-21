@@ -44,8 +44,31 @@ REENTRY_KEEP_DAILY=abc "$ROOT/reentry" prune 2>/dev/null; rc=$?
 set -e
 check "non-numeric retention exits 2" [ "$rc" = 2 ]
 
-check "list reports ok checksum" bash -c "'$ROOT/reentry' list | grep -q 'mysql_shop_20261020T020000Z.sql.gz.*ok'"
-printf x >> "$dir/mysql_shop_20261020T020000Z.sql.gz"
-check "list flags a corrupted file" bash -c "'$ROOT/reentry' list | grep -q CHECKSUM-MISMATCH"
+check "list exits 0 when every checksum is ok" "$ROOT/reentry" list
+
+# a corrupt newest backup must not push good older ones out
+mk mysql_shop_20261021T010000Z.sql.gz
+mk mysql_shop_20261015T010000Z.sql.gz
+printf x >> "$dir/mysql_shop_20261021T010000Z.sql.gz"
+set +e
+"$ROOT/reentry" prune 2>/dev/null; rc=$?
+set -e
+check "prune exits 1 when a group's newest backup is corrupt" [ "$rc" = 1 ]
+check "and leaves that group untouched" present mysql_shop_20261015T010000Z.sql.gz
+
+set +e
+out="$("$ROOT/reentry" list 2>/dev/null)"; rc=$?
+set -e
+check "list exits 1 on a corrupted file" [ "$rc" = 1 ]
+check "list names the corrupted file" grep -q CHECKSUM-MISMATCH <<<"$out"
+
+# a sidecar with no backup and a leftover .partial are cleaned up
+echo x > "$dir/mysql_shop_20200101T010000Z.sql.gz.sha256"
+echo x > "$dir/mysql_shop_20200102T010000Z.sql.gz.partial"
+set +e
+"$ROOT/reentry" prune 2>/dev/null
+set -e
+check "orphan sidecar is removed" [ ! -e "$dir/mysql_shop_20200101T010000Z.sql.gz.sha256" ]
+check "leftover .partial is removed" [ ! -e "$dir/mysql_shop_20200102T010000Z.sql.gz.partial" ]
 
 exit "$fail"

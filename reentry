@@ -3,74 +3,85 @@
 # Exit codes: 0 ok, 1 command failed, 2 usage error, 3 prerequisite missing
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BACKUP_DIR="${REENTRY_BACKUP_DIR:-$ROOT/backups}"
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SELF="$ROOT/reentry"
 ENV_FILE="$ROOT/.env"
 COMPOSE_FILE="$ROOT/compose/docker-compose.yml"
+BACKUP_RE='^(.+)_([0-9]{8}T[0-9]{6}Z)\.sql\.gz$'
 
 log() { printf '%s reentry: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 die() { local code=$1; shift; log "ERROR: $*"; exit "$code"; }
 
-load_env() {
-  [ -f "$ENV_FILE" ] || die 3 ".env not found, copy .env.example to .env and set passwords"
-  set -a; . "$ENV_FILE"; set +a
-  MYSQL_DATABASE="${MYSQL_DATABASE:-shop}"
-  POSTGRES_DB="${POSTGRES_DB:-shop}"
+# Leftovers of the step in flight, removed on exit, Ctrl-C or kill.
+CLEAN_BASE="" CLEAN_CONTAINER=""
+cleanup() {
+  [ -z "$CLEAN_BASE" ] || rm -f -- "$CLEAN_BASE.partial" "$CLEAN_BASE.counts" "$CLEAN_BASE.sha256"
+  [ -z "$CLEAN_CONTAINER" ] || docker rm -f "$CLEAN_CONTAINER" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+need_tools() {
+  [ "${BASH_VERSINFO[0]}" -ge 4 ] || die 3 "bash 4 or newer is required"
+  local t
+  for t in sha256sum gzip flock readlink; do
+    command -v "$t" >/dev/null 2>&1 || die 3 "$t not found on PATH"
+  done
+  date -u -d 2026-01-01 +%G >/dev/null 2>&1 || die 3 "GNU date is required"
 }
 
-need_docker() {
-  command -v docker >/dev/null 2>&1 || die 3 "docker not found on PATH"
+need_docker() { command -v docker >/dev/null 2>&1 || die 3 "docker not found on PATH"; }
+need_env() { [ -f "$ENV_FILE" ] || die 3 ".env not found, copy .env.example to .env and set passwords"; }
+
+# Reads the few settings the CLI needs from .env without running it as shell code.
+# A value already in the environment wins, as it does in Docker Compose.
+# Quote values that contain $ with single quotes. Inline comments are not supported.
+parse_env() {
+  [ -f "$ENV_FILE" ] || return 0
+  local line k v
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [[ $line =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
+    case "$v" in
+      \"*\") v="${v#\"}"; v="${v%\"}" ;;
+      \'*\') v="${v#\'}"; v="${v%\'}" ;;
+    esac
+    case "$k" in
+      MYSQL_DATABASE|POSTGRES_DB|REENTRY_*) [ -n "${!k+x}" ] || export "$k=$v" ;;
+    esac
+  done < "$ENV_FILE"
+}
+
+load_env() {
+  MYSQL_DATABASE="${MYSQL_DATABASE:-shop}"
+  POSTGRES_DB="${POSTGRES_DB:-shop}"
+  [[ $MYSQL_DATABASE =~ ^[A-Za-z0-9_]+$ ]] || die 2 "MYSQL_DATABASE may only contain letters, digits and underscores"
+  [[ $POSTGRES_DB =~ ^[A-Za-z0-9_]+$ ]] || die 2 "POSTGRES_DB may only contain letters, digits and underscores"
 }
 
 compose() { docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"; }
 
 require_running() {
-  local c=$1
-  [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null || true)" = "true" ] ||
-    die 3 "container $c is not running, start it with: ./reentry up"
+  [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" = "true" ] ||
+    die 3 "container $1 is not running, start it with: ./reentry up"
 }
 
-# dump_one <engine> <database> <container> <dump command run inside the container>
-dump_one() {
-  local engine=$1 db=$2 container=$3 cmd=$4
-  local stamp name out
-  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  name="${engine}_${db}_${stamp}.sql.gz"
-  out="$BACKUP_DIR/$name"
-
-  log "backup $engine/$db: dumping from $container"
-  # write to a .partial file so a failed dump never looks like a backup
-  if ! docker exec "$container" sh -c "$cmd" | gzip -9 > "$out.partial"; then
-    rm -f "$out.partial"
-    die 1 "dump of $engine/$db failed"
-  fi
-  gzip -t "$out.partial" || { rm -f "$out.partial"; die 1 "dump of $engine/$db is not valid gzip"; }
-  mv "$out.partial" "$out"
-
-  log "backup $engine/$db: checksumming"
-  (cd "$BACKUP_DIR" && sha256sum "$name" > "$name.sha256")
-  log "backup $engine/$db: ok $name ($(wc -c < "$out" | tr -d ' ') bytes)"
-}
-
-cmd_backup() {
-  need_docker; load_env
-  require_running reentry-mysql
-  require_running reentry-postgres
+# One backup, verify or prune at a time. Child processes inherit the lock on fd 9.
+take_lock() {
   mkdir -p "$BACKUP_DIR"
-  # the password is read inside the container, so it never appears on the host command line
-  dump_one mysql "$MYSQL_DATABASE" reentry-mysql \
-    "MYSQL_PWD=\"\$MYSQL_ROOT_PASSWORD\" mysqldump -uroot --single-transaction --routines --no-tablespaces '$MYSQL_DATABASE'"
-  dump_one postgres "$POSTGRES_DB" reentry-postgres \
-    "pg_dump -U postgres --no-owner '$POSTGRES_DB'"
-  log "backup: done"
+  exec 9>"$BACKUP_DIR/.reentry.lock"
+  flock -n 9 || die 1 "another reentry command is running (lock: $BACKUP_DIR/.reentry.lock)"
 }
 
-# keep these in step with compose/docker-compose.yml
-MYSQL_IMAGE=mysql:8.4
-POSTGRES_IMAGE=postgres:16
-
-latest_backup() {
-  { ls -1 "$BACKUP_DIR"/"$1"_"$2"_*.sql.gz 2>/dev/null || true; } | sort | tail -n 1
+# engine_setup <engine>: sets db, src (source container)
+engine_setup() {
+  case "$1" in
+    mysql) db=$MYSQL_DATABASE; src=reentry-mysql ;;
+    postgres) db=$POSTGRES_DB; src=reentry-postgres ;;
+    *) die 2 "unknown engine $1" ;;
+  esac
 }
 
 # sql <engine> <container> <database> <statement>: prints bare values, one per line
@@ -85,110 +96,214 @@ sql() {
 
 # table_counts <engine> <container> <database>: "table=rows" per line, sorted by table
 table_counts() {
-  local engine=$1 container=$2 db=$3 tables t q
+  local engine=$1 container=$2 db=$3 list t q n bt='`' dq='"'
   case "$engine" in
-    mysql) tables="$(sql mysql "$container" "$db" "SELECT table_name FROM information_schema.tables WHERE table_schema='$db' AND table_type='BASE TABLE' ORDER BY 1")" ;;
-    postgres) tables="$(sql postgres "$container" "$db" "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY 1")" ;;
+    mysql) list="$(sql mysql "$container" "$db" "SELECT table_name FROM information_schema.tables WHERE table_schema='$db' AND table_type='BASE TABLE' ORDER BY 1")" || return 1 ;;
+    postgres) list="$(sql postgres "$container" "$db" "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY 1")" || return 1 ;;
   esac
-  for t in $tables; do
-    if [ "$engine" = mysql ]; then q="\`$t\`"; else q="\"$t\""; fi
-    printf '%s=%s\n' "$t" "$(sql "$engine" "$container" "$db" "SELECT COUNT(*) FROM $q")"
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    if [ "$engine" = mysql ]; then q="$bt${t//$bt/$bt$bt}$bt"; else q="$dq${t//$dq/$dq$dq}$dq"; fi
+    n="$(sql "$engine" "$container" "$db" "SELECT COUNT(*) FROM $q")" || return 1
+    [[ $n =~ ^[0-9]+$ ]] || return 1
+    printf '%s=%s\n' "$t" "$n"
+  done <<<"$list"
+}
+
+# dump_to <engine> <container> <database>: writes a logical dump to stdout
+dump_to() {
+  case "$1" in
+    mysql) docker exec "$2" sh -c \
+      'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysqldump -uroot --single-transaction --routines --no-tablespaces "$1"' _ "$3" ;;
+    postgres) docker exec "$2" pg_dump -U postgres --no-owner "$3" ;;
+  esac
+}
+
+# backup_index: "key<TAB>file" for every backup, newest first within each key (engine_database)
+backup_index() {
+  local f n
+  for f in "$BACKUP_DIR"/*.sql.gz; do
+    [ -e "$f" ] || continue
+    n="${f##*/}"
+    [[ $n =~ $BACKUP_RE ]] || continue
+    printf '%s\t%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$n"
+  done | LC_ALL=C sort -t $'\t' -k1,1 -k2,2r | cut -f1,3
+}
+
+latest_backup() {
+  local k n
+  while IFS=$'\t' read -r k n; do
+    if [ "$k" = "$1_$2" ]; then printf '%s\n' "$n"; return 0; fi
+  done < <(backup_index)
+  return 0
+}
+
+# checksum_ok <file name>: the .sha256 file exists and every file it lists matches
+checksum_ok() {
+  [ -f "$BACKUP_DIR/$1.sha256" ] && (cd "$BACKUP_DIR" && sha256sum -c --status "$1.sha256" 2>/dev/null)
+}
+
+# Runs in its own process (see cmd_backup) so one engine failing never stops the other.
+cmd_backup_engine() {
+  local engine=$1 db src stamp name base marker before after after_tail hash manifest=0
+  need_docker; load_env; engine_setup "$engine"
+  require_running "$src"
+  case "$engine" in mysql) marker='Dump completed' ;; postgres) marker='dump complete' ;; esac
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  name="${engine}_${db}_${stamp}.sql.gz"
+  base="$BACKUP_DIR/$name"
+  CLEAN_BASE="$base"
+
+  before="$(table_counts "$engine" "$src" "$db")" || die 1 "backup $engine/$db: could not read table counts"
+  log "backup $engine/$db: dumping from $src"
+  dump_to "$engine" "$src" "$db" | gzip -9 > "$base.partial" || die 1 "backup $engine/$db: dump failed"
+  after="$(table_counts "$engine" "$src" "$db")" || die 1 "backup $engine/$db: could not read table counts"
+
+  gzip -t "$base.partial" || die 1 "backup $engine/$db: dump is not valid gzip"
+  # gzip -t cannot tell a finished dump from a cut-off one, so look for the dump's closing comment
+  after_tail="$(gzip -dc "$base.partial" | tail -n 10)" || die 1 "backup $engine/$db: could not read the dump back"
+  grep -q "$marker" <<<"$after_tail" || die 1 "backup $engine/$db: dump looks incomplete (no '$marker' trailer)"
+
+  if [ -n "$before" ] && [ "$before" = "$after" ]; then
+    printf '%s\n' "$before" > "$base.counts"; manifest=1
+  else
+    log "backup $engine/$db: WARN source changed during the dump, no row count manifest written, verify will compare with the live source"
+  fi
+
+  # sidecar first, dump last: a crash leaves at worst an orphan sidecar, never a backup without one
+  hash="$(sha256sum < "$base.partial" | cut -d' ' -f1)"
+  {
+    printf '%s  %s\n' "$hash" "$name"
+    if [ "$manifest" = 1 ]; then (cd "$BACKUP_DIR" && sha256sum "$name.counts"); fi
+  } > "$base.sha256"
+  mv "$base.partial" "$base"
+  CLEAN_BASE=""
+  log "backup $engine/$db: ok $name ($(wc -c < "$base" | tr -d ' ') bytes, row counts $([ "$manifest" = 1 ] && echo recorded || echo not recorded))"
+}
+
+run_engines() { # run_engines <internal command>: runs both engines, returns the worst exit code
+  local engine rc=0 r
+  for engine in mysql postgres; do
+    bash "$SELF" "$1" "$engine" || { r=$?; [ "$r" -le "$rc" ] || rc=$r; }
   done
+  return "$rc"
+}
+
+cmd_backup() {
+  take_lock
+  run_engines _backup-engine || die $? "backup: FAILED, see the errors above"
+  log "backup: done"
 }
 
 wait_ready() {
-  local engine=$1 container=$2 i
-  for i in $(seq 1 60); do
+  local engine=$1 container=$2 i=0
+  while [ "$i" -lt 60 ]; do
     # TCP only answers on the final server, not the temporary one the image runs while initialising
     case "$engine" in
       mysql) docker exec "$container" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqladmin ping -h127.0.0.1 -uroot --silent' >/dev/null 2>&1 && return 0 ;;
       postgres) docker exec "$container" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && return 0 ;;
     esac
-    sleep 2
+    sleep 2; i=$((i+1))
   done
   return 1
 }
 
+# integrity_check <engine> <container> <database> <table counts>
+integrity_check() {
+  local engine=$1 c=$2 db=$3 tables=$4 q="${REENTRY_INTEGRITY_SQL:-}" got
+  if [ -z "$q" ]; then
+    if grep -qx 'orders=.*' <<<"$tables" && grep -qx 'order_items=.*' <<<"$tables"; then
+      # default check, written for the sample schema: no order_items row without a parent order
+      q="SELECT COUNT(*) FROM order_items oi LEFT JOIN orders o ON o.id = oi.order_id WHERE o.id IS NULL"
+    else
+      log "verify $engine/$db: WARN no orders and order_items tables and REENTRY_INTEGRITY_SQL not set, skipping the integrity query"
+    fi
+  fi
+  if [ -n "$q" ]; then
+    got="$(sql "$engine" "$c" "$db" "$q")" || die 1 "verify $engine/$db: the integrity query failed to run"
+    [ "$got" = 0 ] || die 1 "verify $engine/$db: integrity query returned '$got', expected 0"
+  fi
+  case "$engine" in
+    mysql)
+      got="$(docker exec "$c" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqlcheck -h127.0.0.1 -uroot --check "$1"' _ "$db")" ||
+        die 1 "verify $engine/$db: mysqlcheck failed"
+      ! grep -qvE 'OK$' <<<"$got" || die 1 "verify $engine/$db: mysqlcheck reported problems" ;;
+    postgres)
+      got="$(sql postgres "$c" "$db" "SELECT COUNT(*) FROM pg_constraint WHERE NOT convalidated")" ||
+        die 1 "verify $engine/$db: constraint check failed to run"
+      [ "$got" = 0 ] || die 1 "verify $engine/$db: $got constraints are not valid" ;;
+  esac
+}
+
 # Runs in its own process (see cmd_verify) so set -e and die work normally for one engine.
 cmd_verify_engine() {
-  local engine=$1 db src image file name tmp want got
-  need_docker; load_env
-  case "$engine" in
-    mysql) db=$MYSQL_DATABASE; src=reentry-mysql; image=$MYSQL_IMAGE ;;
-    postgres) db=$POSTGRES_DB; src=reentry-postgres; image=$POSTGRES_IMAGE ;;
-  esac
+  local engine=$1 db src image name tmp want got
+  need_docker; load_env; engine_setup "$engine"
   require_running "$src"
 
-  file="$(latest_backup "$engine" "$db")"
-  [ -n "$file" ] || die 1 "verify $engine/$db: no backup found in $BACKUP_DIR"
-  name="$(basename "$file")"
+  name="$(latest_backup "$engine" "$db")"
+  [ -n "$name" ] || die 1 "verify $engine/$db: no backup found in $BACKUP_DIR"
   log "verify $engine/$db: latest backup is $name"
-
-  [ -f "$file.sha256" ] || die 1 "verify $engine/$db: checksum file missing for $name"
-  (cd "$BACKUP_DIR" && sha256sum -c --status "$name.sha256") || die 1 "verify $engine/$db: SHA-256 mismatch for $name"
-  gzip -t "$file" || die 1 "verify $engine/$db: $name is not valid gzip"
+  checksum_ok "$name" || die 1 "verify $engine/$db: checksum file missing or SHA-256 mismatch for $name"
+  gzip -t "$BACKUP_DIR/$name" || die 1 "verify $engine/$db: $name is not valid gzip"
   log "verify $engine/$db: checksum and gzip ok"
 
+  # same image as the source, no network, removed when the process exits
+  image="$(docker inspect -f '{{.Config.Image}}' "$src")" || die 1 "verify $engine/$db: cannot read the image of $src"
   tmp="reentry-verify-$engine-$$"
-  trap 'docker rm -f "$tmp" >/dev/null 2>&1 || true' EXIT
-  log "verify $engine/$db: starting throwaway container $tmp"
+  CLEAN_CONTAINER="$tmp"
+  log "verify $engine/$db: starting throwaway container $tmp from $image"
   case "$engine" in
-    mysql) docker run -d --name "$tmp" -e MYSQL_ROOT_PASSWORD=verify -e "MYSQL_DATABASE=$db" "$image" >/dev/null ;;
-    postgres) docker run -d --name "$tmp" -e POSTGRES_PASSWORD=verify -e "POSTGRES_DB=$db" "$image" >/dev/null ;;
-  esac
+    mysql) docker run -d --rm --network none --label reentry.verify=1 --name "$tmp" \
+      -e MYSQL_ROOT_PASSWORD=verify -e "MYSQL_DATABASE=$db" "$image" >/dev/null ;;
+    postgres) docker run -d --rm --network none --label reentry.verify=1 --name "$tmp" \
+      -e POSTGRES_PASSWORD=verify -e "POSTGRES_DB=$db" "$image" >/dev/null ;;
+  esac || die 1 "verify $engine/$db: could not start the throwaway container"
   wait_ready "$engine" "$tmp" || die 1 "verify $engine/$db: throwaway container did not become ready"
 
   log "verify $engine/$db: restoring $name"
   case "$engine" in
-    mysql) gzip -dc "$file" | docker exec -i "$tmp" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -h127.0.0.1 -uroot "$1"' _ "$db" ;;
-    postgres) gzip -dc "$file" | docker exec -i "$tmp" psql -U postgres -d "$db" -q -v ON_ERROR_STOP=1 -o /dev/null ;;
+    mysql) gzip -dc "$BACKUP_DIR/$name" | docker exec -i "$tmp" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -h127.0.0.1 -uroot "$1"' _ "$db" ;;
+    postgres) gzip -dc "$BACKUP_DIR/$name" | docker exec -i "$tmp" psql -U postgres -d "$db" -q -v ON_ERROR_STOP=1 -o /dev/null ;;
   esac || die 1 "verify $engine/$db: restore failed"
 
-  want="$(table_counts "$engine" "$src" "$db")"
-  got="$(table_counts "$engine" "$tmp" "$db")"
-  [ -n "$want" ] || die 1 "verify $engine/$db: source has no tables"
+  if [ -f "$BACKUP_DIR/$name.counts" ]; then
+    want="$(cat "$BACKUP_DIR/$name.counts")"
+    log "verify $engine/$db: comparing with the row counts recorded at backup time"
+  else
+    want="$(table_counts "$engine" "$src" "$db")" || die 1 "verify $engine/$db: could not read source table counts"
+    log "verify $engine/$db: WARN no row count manifest, comparing with the live source, writes since the backup will show as a mismatch"
+  fi
+  got="$(table_counts "$engine" "$tmp" "$db")" || die 1 "verify $engine/$db: could not read restored table counts"
+  [ -n "$want" ] || die 1 "verify $engine/$db: no tables to compare"
   if [ "$want" != "$got" ]; then
-    log "verify $engine/$db: source row counts:"; printf '%s\n' "$want" >&2
+    log "verify $engine/$db: expected row counts:"; printf '%s\n' "$want" >&2
     log "verify $engine/$db: restored row counts:"; printf '%s\n' "$got" >&2
-    die 1 "verify $engine/$db: row counts differ from source"
+    die 1 "verify $engine/$db: row counts differ"
   fi
-  log "verify $engine/$db: row counts match source ($(printf '%s' "$want" | tr '\n' ' '))"
+  log "verify $engine/$db: row counts match ($(printf '%s' "$want" | tr '\n' ' '))"
 
-  # basic integrity: no order_items row points at a missing order (tied to the sample schema)
-  got="$(sql "$engine" "$tmp" "$db" "SELECT COUNT(*) FROM order_items oi LEFT JOIN orders o ON o.id = oi.order_id WHERE o.id IS NULL")"
-  [ "$got" = 0 ] || die 1 "verify $engine/$db: $got order_items rows have no parent order"
-  if [ "$engine" = mysql ]; then
-    got="$(docker exec "$tmp" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqlcheck -h127.0.0.1 -uroot --check "$1"' _ "$db")" ||
-      die 1 "verify $engine/$db: mysqlcheck failed"
-    ! grep -qvE 'OK$' <<<"$got" || die 1 "verify $engine/$db: mysqlcheck reported problems"
-  fi
+  integrity_check "$engine" "$tmp" "$db" "$got"
   log "verify $engine/$db: integrity checks ok"
   log "verify $engine/$db: PASS $name"
 }
 
 cmd_verify() {
-  local engine failed=0
-  for engine in mysql postgres; do
-    "${BASH_SOURCE[0]}" _verify-engine "$engine" || failed=1
-  done
-  [ "$failed" = 0 ] || die 1 "verify: FAILED"
-  log "verify: all backups restore and match the source"
-}
-
-BACKUP_RE='^(.+)_([0-9]{8}T[0-9]{6}Z)\.sql\.gz$'
-
-# backup_files: every backup file name in BACKUP_DIR, newest first within each group
-backup_files() {
-  { ls -1 "$BACKUP_DIR" 2>/dev/null || true; } | grep -E "$BACKUP_RE" |
-    sed -E 's/^(.+)_([0-9]{8}T[0-9]{6}Z)\.sql\.gz$/\1 \2 &/' | sort -k1,1 -k2,2r | cut -d' ' -f3
+  take_lock
+  run_engines _verify-engine || die $? "verify: FAILED, see the errors above"
+  log "verify: all latest backups restore and match"
 }
 
 # Keeps the newest backup of each of the last N days, ISO weeks and months that have one.
-# Needs bash 4 (associative arrays) and GNU date.
+# Returns 1 and leaves the group alone if its newest backup fails its checksum.
 prune_group() {
   local dry=$1 keep_d=$2 keep_w=$3 keep_m=$4; shift 4
   local f stamp day week month nd=0 nw=0 nm=0 keep
   declare -A sd sw sm
+  if ! checksum_ok "$1"; then
+    log "ERROR: prune: newest backup $1 fails its checksum, leaving its group untouched"
+    return 1
+  fi
   for f in "$@"; do
     [[ $f =~ $BACKUP_RE ]]; stamp="${BASH_REMATCH[2]}"
     day="${stamp:0:8}"; month="${stamp:0:6}"
@@ -203,53 +318,72 @@ prune_group() {
     elif [ "$dry" = 1 ]; then
       log "prune: would delete $f"
     else
-      rm -f -- "$BACKUP_DIR/$f" "$BACKUP_DIR/$f.sha256"
+      rm -f -- "$BACKUP_DIR/$f" "$BACKUP_DIR/$f.sha256" "$BACKUP_DIR/$f.counts"
       log "prune: deleted $f"
     fi
   done
 }
 
-cmd_prune() {
-  local dry=0 d w m f key last=
-  [ "${1:-}" = "--dry-run" ] && dry=1
-  [ -z "${1:-}" ] || [ "$dry" = 1 ] || die 2 "prune: unknown option $1"
-  if [ -f "$ENV_FILE" ]; then set -a; . "$ENV_FILE"; set +a; fi
-  d="${REENTRY_KEEP_DAILY:-7}"; w="${REENTRY_KEEP_WEEKLY:-4}"; m="${REENTRY_KEEP_MONTHLY:-6}"
-  for f in "$d" "$w" "$m"; do
-    [[ $f =~ ^[0-9]+$ ]] || die 2 "prune: retention values must be whole numbers, got '$f'"
+# Removes sidecars with no backup and leftover .partial files. Safe because the lock is held.
+prune_orphans() {
+  local dry=$1 f
+  for f in "$BACKUP_DIR"/*.sql.gz.sha256 "$BACKUP_DIR"/*.sql.gz.counts "$BACKUP_DIR"/*.sql.gz.partial; do
+    [ -e "$f" ] || continue
+    case "$f" in *.partial) ;; *) [ ! -e "${f%.*}" ] || continue ;; esac
+    if [ "$dry" = 1 ]; then log "prune: would delete orphan ${f##*/}"; else rm -f -- "$f"; log "prune: deleted orphan ${f##*/}"; fi
   done
+}
+
+cmd_prune() {
+  local dry=0 d w m n key last="" rc=0
+  case "${1:-}" in --dry-run) dry=1 ;; "") ;; *) die 2 "prune: unknown option $1" ;; esac
+  d="${REENTRY_KEEP_DAILY:-7}"; w="${REENTRY_KEEP_WEEKLY:-4}"; m="${REENTRY_KEEP_MONTHLY:-6}"
+  for n in "$d" "$w" "$m"; do
+    [[ $n =~ ^[0-9]+$ ]] || die 2 "prune: retention values must be whole numbers, got '$n'"
+  done
+  take_lock
   log "prune: keeping $d daily, $w weekly, $m monthly (dry run: $dry)"
   local -a group=()
-  while IFS= read -r f; do
-    [[ $f =~ $BACKUP_RE ]]; key="${BASH_REMATCH[1]}"
+  while IFS=$'\t' read -r key n; do
     if [ -n "$last" ] && [ "$key" != "$last" ]; then
-      prune_group "$dry" "$d" "$w" "$m" "${group[@]}"; group=()
+      prune_group "$dry" "$d" "$w" "$m" "${group[@]}" || rc=1
+      group=()
     fi
-    group+=("$f"); last="$key"
-  done < <(backup_files)
-  [ "${#group[@]}" -eq 0 ] || prune_group "$dry" "$d" "$w" "$m" "${group[@]}"
+    group+=("$n"); last="$key"
+  done < <(backup_index)
+  if [ "${#group[@]}" -gt 0 ]; then prune_group "$dry" "$d" "$w" "$m" "${group[@]}" || rc=1; fi
+  prune_orphans "$dry"
+  [ "$rc" = 0 ] || die 1 "prune: finished with problems, see the errors above"
   log "prune: done"
 }
 
+# Exit 1 if there are no backups or any is missing its checksum file or fails it.
 cmd_list() {
-  local f state any=0
-  while IFS= read -r f; do
+  local k n state counts rc=0 any=0
+  while IFS=$'\t' read -r k n; do
     any=1
-    if [ ! -f "$BACKUP_DIR/$f.sha256" ]; then state="no-checksum"
-    elif (cd "$BACKUP_DIR" && sha256sum -c --status "$f.sha256" 2>/dev/null); then state="ok"
-    else state="CHECKSUM-MISMATCH"; fi
-    printf '%s\t%s bytes\t%s\n' "$f" "$(wc -c < "$BACKUP_DIR/$f" | tr -d ' ')" "$state"
-  done < <(backup_files)
-  [ "$any" = 1 ] || log "list: no backups in $BACKUP_DIR"
+    if checksum_ok "$n"; then state=ok
+    elif [ -f "$BACKUP_DIR/$n.sha256" ]; then state=CHECKSUM-MISMATCH; rc=1
+    else state=no-checksum; rc=1; fi
+    if [ -f "$BACKUP_DIR/$n.counts" ]; then counts=counts; else counts=no-counts; fi
+    printf '%s\t%s bytes\t%s\t%s\n' "$n" "$(wc -c < "$BACKUP_DIR/$n" | tr -d ' ')" "$state" "$counts"
+  done < <(backup_index)
+  if [ "$any" = 0 ]; then log "list: no backups in $BACKUP_DIR"; rc=1; fi
+  return "$rc"
 }
 
 cmd_up() {
-  need_docker; load_env
+  need_docker; need_env
   compose up -d --wait
 }
 
 cmd_down() {
-  need_docker; load_env
+  need_docker; need_env
+  if [ "${1:-}" != "--yes" ]; then
+    [ -t 0 ] || die 2 "down deletes the database volumes, pass --yes to confirm"
+    read -r -p "This deletes the MySQL and PostgreSQL data volumes. Type yes to go on: " answer
+    [ "$answer" = yes ] || die 1 "aborted"
+  fi
   compose down -v
 }
 
@@ -257,7 +391,7 @@ usage() {
   cat >&2 <<'EOF'
 usage: reentry <command>
   up       start the MySQL and PostgreSQL containers
-  down     stop them and delete their data volumes
+  down     stop them and delete their data volumes (asks first, or pass --yes)
   backup   dump both databases to backups/ with SHA-256 checksums
   verify   restore the latest backups into throwaway containers and check them
   prune    apply retention (7 daily, 4 weekly, 6 monthly), add --dry-run to preview
@@ -266,13 +400,22 @@ EOF
 }
 
 case "${1:-}" in
-  up)     cmd_up ;;
-  down)   cmd_down ;;
+  -h|--help|help) usage; exit 0 ;;
+  up|down|backup|verify|prune|list|_backup-engine|_verify-engine) ;;
+  *) usage; exit 2 ;;
+esac
+
+need_tools
+parse_env
+BACKUP_DIR="${REENTRY_BACKUP_DIR:-$ROOT/backups}"
+
+case "$1" in
+  up) cmd_up ;;
+  down) cmd_down "${2:-}" ;;
   backup) cmd_backup ;;
   verify) cmd_verify ;;
-  _verify-engine) cmd_verify_engine "${2:?engine}" ;;
   prune) cmd_prune "${2:-}" ;;
   list) cmd_list ;;
-  -h|--help|help) usage ;;
-  *) usage; exit 2 ;;
+  _backup-engine) cmd_backup_engine "${2:?engine}" ;;
+  _verify-engine) cmd_verify_engine "${2:?engine}" ;;
 esac

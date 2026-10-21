@@ -1,5 +1,4 @@
--- Fake sample data only.
-USE shop;
+-- Fake sample data only. Runs in the database named by MYSQL_DATABASE.
 
 CREATE TABLE customers (
   id INT PRIMARY KEY AUTO_INCREMENT,

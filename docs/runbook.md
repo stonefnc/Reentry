@@ -59,10 +59,11 @@ Goal: pick the newest backup that is both clean and complete.
 1. Decide the earliest time the attacker could have been present. If you do
    not know, assume earlier than you think and choose an older backup.
 2. List the backups from a clean machine that has read-only access to the
-   backup storage:
+   backup storage. Point `REENTRY_BACKUP_DIR` at the folder holding the
+   backups. This needs only the `reentry` script and basic tools, not Docker:
 
    ```
-   ./reentry list
+   REENTRY_BACKUP_DIR=/mnt/backups ./reentry list
    ```
 
 3. Ignore any backup newer than the earliest possible compromise time. A
@@ -70,6 +71,13 @@ Goal: pick the newest backup that is both clean and complete.
 4. Ignore any backup that shows `CHECKSUM-MISMATCH` or `no-checksum`.
 5. Pick the newest backup that is left. Write down its file name and its
    SHA-256 value.
+
+What the checksum does and does not tell you: the `.sha256` file sits next to
+the backup, so anyone who can change the backup can change both. A match shows
+the file was not damaged. It does not show the file is clean. Compare the
+hash with a copy that was stored somewhere else at backup time, such as a
+ticket, a separate log or another host. Record hashes off host at backup time
+from now on.
 
 If there is no usable backup, stop and tell the incident lead. Recovery then
 becomes a different, longer process.
@@ -82,11 +90,15 @@ Goal: a place to restore that the attacker has never touched.
 - [ ] Install the same major version of the database as the backup came from.
 - [ ] Set new passwords for every account. Do not reuse old ones.
 - [ ] Keep the new host off the production network for now.
-- [ ] Copy the chosen backup and its `.sha256` file to the new host.
+- [ ] Copy the chosen backup to the new host, together with its `.sha256` and
+      `.counts` files. Do the copy from read-only storage: ask whoever runs
+      the storage to export the files, or mount it read-only. Move them by
+      removable media or a one-way path. Never mount the backup storage
+      writable on the new host.
 
 ## 5. Restore
 
-Check the file first. Run this in the folder that holds the backup:
+Check the file first. Run this in the folder that holds the three files:
 
 ```
 sha256sum -c mysql_shop_20260101T000000Z.sql.gz.sha256
@@ -113,12 +125,30 @@ gzip -dc postgres_shop_20260101T000000Z.sql.gz | psql -U postgres -d shop -v ON_
 Any error during the load means the restore is not trustworthy. Stop and
 investigate before going on.
 
+The dumps hold tables and data only. They do not hold database users or
+grants. Recreate the application accounts from your own records, with new
+passwords and the fewest privileges the application needs.
+
+MySQL:
+
+```
+mysql -uroot -p -e "CREATE USER 'app'@'%' IDENTIFIED BY 'NEW_PASSWORD'" -e "GRANT SELECT, INSERT, UPDATE, DELETE ON shop.* TO 'app'@'%'"
+```
+
+PostgreSQL:
+
+```
+psql -U postgres -d shop -c "CREATE ROLE app LOGIN PASSWORD 'NEW_PASSWORD'" -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app" -c "GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO app"
+```
+
 ## 6. Validate
 
 Goal: prove the restored data is whole before anyone relies on it.
 
-- [ ] Compare row counts per table with the last numbers you trust. If you ran
-      `./reentry verify` before the attack, its log lines hold the counts.
+- [ ] Compare row counts per table with the `.counts` file that came with the
+      backup. It lists `table=rows`, was recorded at backup time and is covered
+      by the `.sha256` file. A backup made while the database was changing has
+      no `.counts` file, so use counts from a source you trust instead.
 - [ ] Run an integrity check. For example, look for child rows with no parent
       row, and on MySQL run `mysqlcheck --check`.
 - [ ] Ask a business owner to spot check known records.
