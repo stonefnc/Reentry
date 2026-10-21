@@ -139,6 +139,30 @@ every backup and rewrites the catalog. `status` warns when the files in the
 folder and the catalog disagree. The off-host state is what Reentry last
 recorded. It is not a live check of the destination.
 
+### Failure notices
+
+Opt-in. When a `backup` or `verify` run fails, Reentry can tell you. Set one or
+both in `.env`:
+
+- `REENTRY_NOTIFY_CMD`: a shell command, run with `bash -c`, with the
+  environment variables `REENTRY_EVENT` and `REENTRY_MESSAGE` set. Quote the
+  value with single quotes so `$` is kept. This runs whatever is in `.env` as
+  shell code, so keep `.env` writable only by you.
+- `REENTRY_NOTIFY_WEBHOOK`: an `http` or `https` URL that receives a JSON POST
+  `{"event": ..., "text": ...}` through `curl`. The URL is passed to `curl` on
+  standard input, so it does not show in a process list. It is a secret, so it
+  lives in `.env` only.
+
+The event is `backup-failed`, `verify-failed`, or `offhost-failed` when the
+off-host copy was the only thing that went wrong in a backup. The message holds
+the host name, the exit code and the reasons from the log. It never holds
+settings or passwords. A failed run sends one notice. A successful run, a
+Ctrl-C and a kill send none. With neither setting set nothing is sent and
+nothing is logged about it. If the notice cannot be sent, a warning is logged
+and the exit code of the run stays what it was. The command is stopped after 30
+seconds and the webhook after 10. `curl` must be installed for the webhook.
+Failures of `restore`, `prune` and `status` do not send notices.
+
 ### restore
 
 ```
@@ -234,6 +258,7 @@ written to be followed under pressure.
 | Encryption (`gpg`, `openssl`) | written, logic tested against a fake `docker` with the real `gpg` and `openssl`, not run against real Docker |
 | Off-host copy (folder and rsync/ssh) | written, logic tested against a fake `docker`, `rsync` and `ssh`, not run against real Docker, a real ssh host or a real share |
 | `prune`, `list` | built and tested, no Docker needed |
+| Failure notices (command and webhook) | written, tested against the fake `docker` and a fake `curl`, no real mail system or webhook has been called |
 | `status` and the backup catalog | written, tested against the fake `docker`, no Docker needed to run it |
 | Runbook | written, restore commands not run |
 | End-to-end test (`test/e2e.sh`) | written, not run (needs Docker) |
@@ -246,7 +271,7 @@ the corruption test fails verify as expected. That has not been shown yet.
 | Command | Needs Docker | Result so far |
 |---|---|---|
 | `bash test/prune.sh` | no | 18 checks passed under WSL bash |
-| `bash test/fake.sh` | no | 148 checks passed under WSL bash (uses the installed `gpg` and `openssl`, and skips a tool that is missing) |
+| `bash test/fake.sh` | no | 174 checks passed under WSL bash (uses the installed `gpg` and `openssl`, and skips a tool that is missing) |
 | `bash test/e2e.sh` | yes | not run, only its syntax and the Docker-missing exit were checked |
 
 `test/e2e.sh` starts the sample databases if needed, takes a real backup in a

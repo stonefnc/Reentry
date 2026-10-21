@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# A stand-in for curl, used by test/fake.sh for the notify webhook. It records the arguments, the
+# configuration read from stdin and the request body in FAKE_CURL_LOG. FAKE_CURL_FAIL=1 makes it fail.
+{
+  echo "args: $*"
+  if [ "$1" = --config ] && [ "$2" = - ]; then echo "config: $(cat)"; fi
+} >> "${FAKE_CURL_LOG:-/dev/null}"
+[ -z "${FAKE_CURL_FAIL:-}" ] || exit 22

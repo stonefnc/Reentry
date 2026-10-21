@@ -10,11 +10,24 @@ COMPOSE_FILE="$ROOT/compose/docker-compose.yml"
 BACKUP_RE='^(.+)_([0-9]{8}T[0-9]{6}Z)\.sql\.gz(\.enc)?$'
 
 log() { printf '%s reentry: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
-die() { local code=$1; shift; log "ERROR: $*"; exit "$code"; }
+die() {
+  local code=$1; shift
+  log "ERROR: $*"
+  # a command and its engine processes share this file, so the failure notice can list the reasons
+  [ -z "${_REENTRY_FAILS:-}" ] || printf '%s\n' "$*" >> "$_REENTRY_FAILS" || true
+  exit "$code"
+}
 
 # Leftovers of the step in flight, removed on exit, Ctrl-C or kill.
-CLEAN_BASE="" CLEAN_CONTAINER="" CLEAN_OFF=()
+CLEAN_BASE="" CLEAN_CONTAINER="" CLEAN_OFF=() NOTIFY_CTX=""
 cleanup() {
+  local rc=$?
+  # a failed backup or verify sends a notice, Ctrl-C and kill (128 and up) do not
+  # only the command that started the notice cleans up the shared file, its engine processes must not
+  if [ -n "$NOTIFY_CTX" ]; then
+    if [ "$rc" -ne 0 ] && [ "$rc" -lt 128 ]; then notify_failure "$NOTIFY_CTX" "$rc" || true; fi
+    [ -z "${_REENTRY_FAILS:-}" ] || rm -f -- "$_REENTRY_FAILS"
+  fi
   [ -z "$CLEAN_BASE" ] || rm -f -- "$CLEAN_BASE.partial" "$CLEAN_BASE.plain.partial" "$CLEAN_BASE.counts" "$CLEAN_BASE.sha256"
   [ -z "${CATALOG:-}" ] || rm -f -- "$CATALOG.tmp"
   [ "${#CLEAN_OFF[@]}" -eq 0 ] || rm -f -- "${CLEAN_OFF[@]}"
@@ -240,6 +253,60 @@ read_backup() {
   esac
 }
 
+# Optional failure notice. REENTRY_NOTIFY_CMD is a shell command run with REENTRY_EVENT and
+# REENTRY_MESSAGE in its environment, and REENTRY_NOTIFY_WEBHOOK is a URL that gets a JSON
+# POST with event and text. Both come from .env, which is where a webhook secret belongs. The
+# URL goes to curl on stdin so it never shows in a process list. Nothing is sent when neither
+# is set, and a problem sending is only a warning, it never changes the exit code of the run.
+
+# notify_begin <backup|verify>: from here on a failure of this command sends a notice
+notify_begin() {
+  NOTIFY_CTX=$1
+  [ -n "${REENTRY_NOTIFY_CMD:-}${REENTRY_NOTIFY_WEBHOOK:-}" ] || return 0
+  _REENTRY_FAILS="$(mktemp)"; export _REENTRY_FAILS
+}
+
+json_escape() { printf '%s' "$1" | tr '\n\r\t' '   ' | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# notify <event> <message>
+notify() {
+  local ev=$1 msg=$2 url="${REENTRY_NOTIFY_WEBHOOK:-}"
+  if [ -n "${REENTRY_NOTIFY_CMD:-}" ]; then
+    REENTRY_EVENT="$ev" REENTRY_MESSAGE="$msg" timeout 30 bash -c "$REENTRY_NOTIFY_CMD" >/dev/null 2>&1 ||
+      log "WARN notify: REENTRY_NOTIFY_CMD failed or timed out"
+  fi
+  if [ -n "$url" ]; then
+    if [[ ! $url =~ ^https?://[^[:space:]\"\\]+$ ]]; then
+      log "WARN notify: REENTRY_NOTIFY_WEBHOOK is not an http or https URL"
+    elif ! command -v curl >/dev/null 2>&1; then
+      log "WARN notify: curl not found, the webhook was not called"
+    else
+      printf 'url = "%s"\n' "$url" |
+        curl --config - -sS --fail --max-time 10 -X POST -H 'Content-Type: application/json' \
+          --data "{\"event\":\"$(json_escape "$ev")\",\"text\":\"$(json_escape "$msg")\"}" >/dev/null 2>&1 ||
+        log "WARN notify: the webhook call failed"
+    fi
+  fi
+}
+
+# notify_failure <backup|verify> <exit code>. The event is backup-failed, verify-failed, or
+# offhost-failed when the only thing that went wrong in a backup was the off-host copy.
+notify_failure() {
+  local ctx=$1 rc=$2 event="$1-failed" reasons="" line only_offhost=0
+  [ -n "${REENTRY_NOTIFY_CMD:-}${REENTRY_NOTIFY_WEBHOOK:-}" ] || return 0
+  if [ -n "${_REENTRY_FAILS:-}" ] && [ -s "$_REENTRY_FAILS" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        *": FAILED, see the errors above") ;;
+        *"off-host copy FAILED"*) [ "$only_offhost" = 2 ] || only_offhost=1; reasons="$reasons$line. " ;;
+        *) only_offhost=2; reasons="$reasons$line. " ;;
+      esac
+    done < "$_REENTRY_FAILS"
+  fi
+  if [ "$ctx" = backup ] && [ "$only_offhost" = 1 ]; then event=offhost-failed; fi
+  notify "$event" "reentry $ctx failed on $(hostname 2>/dev/null || echo host) with exit code $rc. ${reasons:-no detail recorded}"
+}
+
 # offhost_setup: reads REENTRY_OFFHOST_DEST and sets OFFHOST_KIND (none, path or remote),
 # OFFHOST_HOST and OFFHOST_PATH. A destination like host:/dir goes over rsync and ssh,
 # anything else is a folder, for example a mounted share.
@@ -361,6 +428,7 @@ run_engines() { # run_engines <internal command>: runs both engines, returns the
 }
 
 cmd_backup() {
+  notify_begin backup
   encrypt_setup; offhost_setup
   take_lock
   run_engines _backup-engine || die $? "backup: FAILED, see the errors above"
@@ -474,6 +542,7 @@ cmd_verify_engine() {
 }
 
 cmd_verify() {
+  notify_begin verify
   take_lock
   run_engines _verify-engine || die $? "verify: FAILED, see the errors above"
   log "verify: all latest backups restore and match"

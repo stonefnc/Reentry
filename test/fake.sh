@@ -301,6 +301,63 @@ check "and status exits 1 for it" [ "$rc" = 1 ]
 run prune
 check "prune keeps the catalog in step (rows survive, off-host state kept)" [ "$(cut -f6 "$REENTRY_BACKUP_DIR/.catalog.tsv" | grep -c '^failed$')" = 2 ]
 
+# failure notification
+export NOTE="$tmp/note" FAKE_CURL_LOG="$tmp/curl.log"
+rm -f "$NOTE" "$FAKE_CURL_LOG"
+export REENTRY_NOTIFY_CMD='printf "%s|%s\n" "$REENTRY_EVENT" "$REENTRY_MESSAGE" >> "$NOTE"'
+fresh n1
+run backup
+run verify
+check "no notice is sent when backup and verify succeed" [ ! -e "$NOTE" ]
+FAKE_FAIL_DUMP=1 run backup
+check "a failed backup keeps its exit code" [ "$rc" = 1 ]
+check "a failed backup runs the notify command once" [ "$(grep -c . "$NOTE")" = 1 ]
+check "the event is backup-failed" grep -q '^backup-failed|' "$NOTE"
+check "the notice carries the exit code and the reason" grep -q 'exit code 1.*dump failed' "$NOTE"
+rm -f "$NOTE"
+FAKE_DOWN=reentry-mysql run backup
+check "a missing container is exit 3" [ "$rc" = 3 ]
+check "the notice carries exit code 3" grep -q 'exit code 3' "$NOTE"
+rm -f "$NOTE"
+FAKE_DROP_ROW=1 run verify
+check "a failed verify keeps its exit code" [ "$rc" = 1 ]
+check "the event is verify-failed" grep -q '^verify-failed|.*row counts differ' "$NOTE"
+rm -f "$NOTE"
+fresh n2
+REENTRY_OFFHOST_DEST="$tmp/not-mounted" run backup
+check "an off-host failure keeps exit 1" [ "$rc" = 1 ]
+check "the event is offhost-failed" grep -q '^offhost-failed|' "$NOTE"
+check "one notice per failed run" [ "$(grep -c . "$NOTE")" = 1 ]
+rm -f "$NOTE"
+FAKE_FAIL_DUMP=1 REENTRY_OFFHOST_DEST="$tmp/not-mounted" run backup
+check "a dump failure plus an off-host problem is a backup-failed event" grep -q '^backup-failed|' "$NOTE"
+rm -f "$NOTE"
+REENTRY_NOTIFY_CMD='exit 7' FAKE_FAIL_DUMP=1 run backup
+check "a failing notify command never changes the exit code" [ "$rc" = 1 ]
+check "and is only a warning" has "WARN notify: REENTRY_NOTIFY_CMD failed"
+unset REENTRY_NOTIFY_CMD
+FAKE_FAIL_DUMP=1 run backup
+check "with nothing configured a failure is silent about notices" bash -c "! grep -q notify '$tmp/out'"
+check "and nothing was sent" [ ! -e "$NOTE" ]
+
+export REENTRY_NOTIFY_WEBHOOK='https://hooks.example.test/services/not-a-real-secret'
+fresh n3
+run backup
+check "webhook: nothing is posted on success" [ ! -s "$FAKE_CURL_LOG" ]
+FAKE_FAIL_DUMP=1 run backup
+check "webhook: a failed backup posts once" [ "$(grep -c '^args:' "$FAKE_CURL_LOG")" = 1 ]
+check "webhook: the body names the event" grep -q 'backup-failed' "$FAKE_CURL_LOG"
+check "webhook: the URL is read from stdin" grep -q '^config: url = "https://hooks.example.test/services/not-a-real-secret"' "$FAKE_CURL_LOG"
+check "webhook: the URL is not in the curl arguments" bash -c "! grep '^args:' '$FAKE_CURL_LOG' | grep -q not-a-real-secret"
+: > "$FAKE_CURL_LOG"
+FAKE_CURL_FAIL=1 FAKE_FAIL_DUMP=1 run backup
+check "webhook: a failing call keeps the exit code" [ "$rc" = 1 ]
+check "webhook: and is only a warning" has "WARN notify: the webhook call failed"
+REENTRY_NOTIFY_WEBHOOK='ftp://example.test/x' FAKE_FAIL_DUMP=1 run backup
+check "webhook: a URL that is not http or https is refused with a warning" has "not an http or https URL"
+check "webhook: and the exit code is kept" [ "$rc" = 1 ]
+unset REENTRY_NOTIFY_WEBHOOK
+
 fresh e
 check "list exits 1 on an empty folder" bash -c "! '$ROOT/reentry' list"
 
