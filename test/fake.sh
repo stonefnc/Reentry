@@ -233,6 +233,74 @@ check "an unknown encryption tool exits 2" [ "$rc" = 2 ]
 REENTRY_ENCRYPT=openssl REENTRY_ENCRYPT_KEY_FILE="$tmp/empty-key" run backup
 check "an empty key file exits 3" [ "$rc" = 3 ]
 
+# catalog and status
+fresh s1
+run status
+check "status with no catalog exits 1" [ "$rc" = 1 ]
+check "and says how to create it" has "status --refresh"
+run backup
+check "backup writes the catalog" [ -f "$REENTRY_BACKUP_DIR/.catalog.tsv" ]
+check "the catalog has one row per backup" [ "$(wc -l < "$REENTRY_BACKUP_DIR/.catalog.tsv" | tr -d ' ')" = 2 ]
+check "both rows record checksum ok" [ "$(cut -f4 "$REENTRY_BACKUP_DIR/.catalog.tsv" | grep -c '^ok$')" = 2 ]
+check "off-host is none when no destination is set" [ "$(cut -f6 "$REENTRY_BACKUP_DIR/.catalog.tsv" | grep -c '^none$')" = 2 ]
+run status
+check "status exits 0 after a good backup" [ "$rc" = 0 ]
+check "status names both engines" [ "$(grep -c '^mysql/shop\|^postgres/shop' "$tmp/out")" = 2 ]
+check "status shows the latest good backup and its age" has "latest good .*age 0h"
+check "status says off-host is not configured" has "off-host not configured"
+run list
+check "list shows the off-host state from the catalog" has "off-host none"
+
+first_my="$(ls "$REENTRY_BACKUP_DIR" | grep '^mysql.*\.sql\.gz$')"
+printf x >> "$REENTRY_BACKUP_DIR/$first_my"
+run status
+check "status trusts the catalog until a refresh (size changed, hash cached)" [ "$rc" = 0 ] 
+run status --refresh
+check "status --refresh re-hashes and finds the damaged backup" [ "$rc" = 1 ]
+check "the failure names the engine" has "has no good backup"
+check "the catalog now records the mismatch" grep -q "mismatch" "$REENTRY_BACKUP_DIR/.catalog.tsv"
+
+fresh s2
+mkdir -p "$REENTRY_BACKUP_DIR"
+mkold() { # mkold <engine> <stamp>: a small fake backup with a valid checksum file
+  local n="${1}_shop_${2}.sql.gz"
+  printf 'x' > "$REENTRY_BACKUP_DIR/$n"
+  (cd "$REENTRY_BACKUP_DIR" && sha256sum "$n" > "$n.sha256")
+}
+mkold mysql 20200101T000000Z; mkold postgres 20200101T000000Z
+run status --refresh
+check "backups older than the age limit make status exit 1" [ "$rc" = 1 ]
+check "the stale backup is named" has "older than 48 hours"
+REENTRY_MAX_AGE_HOURS=100000 run status
+check "REENTRY_MAX_AGE_HOURS raises the limit" [ "$rc" = 0 ]
+REENTRY_MAX_AGE_HOURS=abc run status
+check "a bad REENTRY_MAX_AGE_HOURS exits 2" [ "$rc" = 2 ]
+run status --bogus
+check "an unknown status option exits 2" [ "$rc" = 2 ]
+mkold mysql 20200102T000000Z
+run status
+check "status warns when the catalog is out of date" has "does not match the files"
+
+fresh s3; off="$tmp/off-s3"; mkdir -p "$off"
+REENTRY_OFFHOST_DEST="$off" run backup
+REENTRY_OFFHOST_DEST="$off" run status
+check "off-host verified: status exits 0" [ "$rc" = 0 ]
+check "status shows the off-host state as verified" has "off-host verified"
+check "the catalog records verified for both" [ "$(cut -f6 "$REENTRY_BACKUP_DIR/.catalog.tsv" | grep -c '^verified$')" = 2 ]
+fresh s4; off="$tmp/off-s4"; mkdir -p "$off"
+run backup
+REENTRY_OFFHOST_DEST="$off" run status
+check "off-host configured but never copied: status exits 1" [ "$rc" = 1 ]
+check "the missing copy is reported" has "no verified off-host copy"
+check "status shows missing" has "off-host missing"
+fresh s5
+REENTRY_OFFHOST_DEST="$tmp/not-mounted" run backup
+check "a failed off-host copy is recorded as failed" [ "$(cut -f6 "$REENTRY_BACKUP_DIR/.catalog.tsv" | grep -c '^failed$')" = 2 ]
+REENTRY_OFFHOST_DEST="$tmp/not-mounted" run status
+check "and status exits 1 for it" [ "$rc" = 1 ]
+run prune
+check "prune keeps the catalog in step (rows survive, off-host state kept)" [ "$(cut -f6 "$REENTRY_BACKUP_DIR/.catalog.tsv" | grep -c '^failed$')" = 2 ]
+
 fresh e
 check "list exits 1 on an empty folder" bash -c "! '$ROOT/reentry' list"
 

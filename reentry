@@ -16,6 +16,7 @@ die() { local code=$1; shift; log "ERROR: $*"; exit "$code"; }
 CLEAN_BASE="" CLEAN_CONTAINER="" CLEAN_OFF=()
 cleanup() {
   [ -z "$CLEAN_BASE" ] || rm -f -- "$CLEAN_BASE.partial" "$CLEAN_BASE.plain.partial" "$CLEAN_BASE.counts" "$CLEAN_BASE.sha256"
+  [ -z "${CATALOG:-}" ] || rm -f -- "$CATALOG.tmp"
   [ "${#CLEAN_OFF[@]}" -eq 0 ] || rm -f -- "${CLEAN_OFF[@]}"
   [ -z "$CLEAN_CONTAINER" ] || docker rm -f "$CLEAN_CONTAINER" >/dev/null 2>&1 || true
 }
@@ -143,6 +144,50 @@ latest_backup() {
 checksum_ok() {
   [ -f "$BACKUP_DIR/$1.sha256" ] && (cd "$BACKUP_DIR" && sha256sum -c --status "$1.sha256" 2>/dev/null)
 }
+
+# The catalog is a tab separated file next to the backups, one row per backup:
+# name, size, mtime, checksum state (ok, mismatch or none), when it was checked,
+# off-host state (verified, failed or none) and when that was set. It is rewritten by
+# backup, prune and status --refresh, always under the lock, through a temporary file.
+# A row whose size and mtime are unchanged and was ok keeps its state without hashing the
+# dump again. status --refresh hashes everything.
+
+# catalog_rebuild [force]: rewrites the rows from the files in the backup folder and keeps
+# the off-host columns of backups that are still there
+catalog_rebuild() {
+  local force="${1:-}" k n size mtime old cs checked now osize omtime ocs ochecked off off_at
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  while IFS=$'\t' read -r k n; do
+    read -r size mtime < <(stat -c '%s %Y' -- "$BACKUP_DIR/$n")
+    old=""; [ ! -f "$CATALOG" ] || old="$(awk -F'\t' -v n="$n" '$1==n' "$CATALOG")"
+    osize="" omtime="" ocs="" ochecked="" off="" off_at=""
+    [ -z "$old" ] || IFS=$'\t' read -r _ osize omtime ocs ochecked off off_at <<<"$old"
+    if [ -z "$force" ] && [ "$ocs" = ok ] && [ "$osize" = "$size" ] && [ "$omtime" = "$mtime" ]; then
+      cs=ok; checked="$ochecked"
+    else
+      if checksum_ok "$n"; then cs=ok
+      elif [ -f "$BACKUP_DIR/$n.sha256" ]; then cs=mismatch
+      else cs=none; fi
+      checked="$now"
+    fi
+    [ -n "$off" ] || { off=none; off_at=-; }
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$size" "$mtime" "$cs" "$checked" "$off" "$off_at"
+  done < <(backup_index) > "$CATALOG.tmp"
+  mv -f -- "$CATALOG.tmp" "$CATALOG"
+}
+
+# catalog_set_off <file name> <verified|failed|none>: records the off-host state of one backup
+catalog_set_off() {
+  [ -f "$CATALOG" ] || return 0
+  awk -F'\t' -v OFS='\t' -v n="$1" -v s="$2" -v t="$(date -u +%Y-%m-%dT%H:%M:%SZ)" '$1==n{$6=s;$7=t} {print}' "$CATALOG" > "$CATALOG.tmp" &&
+    mv -f -- "$CATALOG.tmp" "$CATALOG"
+}
+
+# catalog_update: a catalog problem is logged and never fails a backup or a prune
+catalog_update() { catalog_rebuild "$@" || log "WARN could not update the catalog $CATALOG"; }
+
+# catalog_field <file name> <column number>: one field of a backup's catalog row
+catalog_field() { [ -f "$CATALOG" ] && awk -F'\t' -v n="$1" -v c="$2" '$1==n{print $c; exit}' "$CATALOG"; }
 
 # Optional encryption at rest. REENTRY_ENCRYPT is gpg or openssl and REENTRY_ENCRYPT_KEY_FILE
 # names a file whose first line is the passphrase. The passphrase is never put on a command line.
@@ -298,7 +343,13 @@ cmd_backup_engine() {
   mv "$base.partial" "$base"
   CLEAN_BASE=""
   log "backup $engine/$db: ok $name ($(wc -c < "$base" | tr -d ' ') bytes, $([ -n "$ENC_TOOL" ] && echo "encrypted with $ENC_TOOL" || echo plaintext), row counts $([ "$manifest" = 1 ] && echo recorded || echo not recorded))"
-  offhost_copy "$name" || die 1 "backup $engine/$db: off-host copy FAILED, the local backup $name is kept"
+  catalog_update
+  if offhost_copy "$name"; then
+    [ "$OFFHOST_KIND" = none ] || catalog_set_off "$name" verified
+  else
+    catalog_set_off "$name" failed
+    die 1 "backup $engine/$db: off-host copy FAILED, the local backup $name is kept"
+  fi
 }
 
 run_engines() { # run_engines <internal command>: runs both engines, returns the worst exit code
@@ -585,6 +636,7 @@ cmd_prune() {
   done < <(backup_index)
   if [ "${#group[@]}" -gt 0 ]; then prune_group "$dry" "$d" "$w" "$m" "${group[@]}" || rc=1; fi
   prune_orphans "$dry"
+  [ "$dry" = 1 ] || catalog_update
   [ "$rc" = 0 ] || die 1 "prune: finished with problems, see the errors above"
   log "prune: done"
 }
@@ -598,10 +650,66 @@ cmd_list() {
     elif [ -f "$BACKUP_DIR/$n.sha256" ]; then state=CHECKSUM-MISMATCH; rc=1
     else state=no-checksum; rc=1; fi
     if [ -f "$BACKUP_DIR/$n.counts" ]; then counts=counts; else counts=no-counts; fi
-    printf '%s\t%s bytes\t%s\t%s\n' "$n" "$(wc -c < "$BACKUP_DIR/$n" | tr -d ' ')" "$state" "$counts"
+    printf '%s\t%s bytes\t%s\t%s\toff-host %s\n' "$n" "$(wc -c < "$BACKUP_DIR/$n" | tr -d ' ')" "$state" "$counts" "$(catalog_field "$n" 6 || echo unknown)"
   done < <(backup_index)
   if [ "$any" = 0 ]; then log "list: no backups in $BACKUP_DIR"; rc=1; fi
   return "$rc"
+}
+
+# age_text <seconds>
+age_text() {
+  local s=$1
+  if [ "$s" -ge 86400 ]; then printf '%sd %sh' $((s/86400)) $((s%86400/3600))
+  else printf '%sh %sm' $((s/3600)) $((s%3600/60)); fi
+}
+
+# One line per engine from the catalog, no Docker needed. Exit 1 if an engine has no backup, its
+# newest backup fails its checksum, its newest good backup is older than REENTRY_MAX_AGE_HOURS
+# (default 48), or an off-host destination is set and that backup has no verified copy there.
+cmd_status() {
+  local refresh="" engine db src n cs off off_at stamp epoch age latest="" newest="" newest_cs="" count=0 bad=0 rc=0
+  local max="${REENTRY_MAX_AGE_HOURS:-48}" configured=0 want have
+  case "${1:-}" in --refresh) refresh=force ;; "") ;; *) die 2 "status: unknown option $1" ;; esac
+  [[ $max =~ ^[0-9]+$ ]] || die 2 "status: REENTRY_MAX_AGE_HOURS must be a whole number, got '$max'"
+  load_env
+  [ -z "${REENTRY_OFFHOST_DEST:-}" ] || configured=1
+  if [ -n "$refresh" ]; then
+    take_lock
+    catalog_rebuild force || die 1 "status: could not write the catalog"
+  fi
+  [ -f "$CATALOG" ] || die 1 "status: no catalog in $BACKUP_DIR yet, take a backup or run: reentry status --refresh"
+  want="$(backup_index | cut -f2 | LC_ALL=C sort)"; have="$(cut -f1 "$CATALOG" | LC_ALL=C sort)"
+  if [ "$want" != "$have" ]; then
+    log "status: WARN the catalog does not match the files in $BACKUP_DIR, run: reentry status --refresh"
+  fi
+  printf 'catalog %s, updated %s\n' "$CATALOG" "$(date -u -d "@$(stat -c %Y -- "$CATALOG")" +%Y-%m-%dT%H:%M:%SZ)"
+  for engine in mysql postgres; do
+    engine_setup "$engine"
+    latest="" newest="" count=0 bad=0
+    while IFS=$'\t' read -r n _ _ cs _ off off_at; do
+      [[ $n == "${engine}_${db}_"* ]] || continue
+      [ -n "$newest" ] || { newest=$n; newest_cs=$cs; }
+      count=$((count+1))
+      if [ "$cs" != ok ]; then bad=$((bad+1))
+      elif [ -z "$latest" ]; then latest=$n; fi
+    done < <(LC_ALL=C sort -t $'\t' -k1,1r "$CATALOG")
+    if [ -z "$latest" ]; then
+      printf '%s/%s\tno good backup\t%s backups, %s bad\n' "$engine" "$db" "$count" "$bad"
+      log "status: PROBLEM $engine/$db has no good backup"; rc=1
+    else
+      [[ $latest =~ $BACKUP_RE ]]; stamp="${BASH_REMATCH[2]}"
+      epoch="$(date -u -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2} ${stamp:9:2}:${stamp:11:2}:${stamp:13:2}" +%s)"
+      age=$(( $(date -u +%s) - epoch ))
+      off="$(catalog_field "$latest" 6)"; off_at="$(catalog_field "$latest" 7)"
+      printf '%s/%s\tlatest good %s\tage %s\tchecksum ok\toff-host %s\t%s backups, %s bad\n' \
+        "$engine" "$db" "$latest" "$(age_text "$age")" "$([ "$off" = verified ] && echo "verified $off_at" || { [ "$configured" = 1 ] && echo missing || echo "not configured"; })" "$count" "$bad"
+      [ "$newest" = "$latest" ] || { log "status: PROBLEM the newest $engine/$db backup $newest fails its checksum"; rc=1; }
+      [ "$age" -le $((max*3600)) ] || { log "status: PROBLEM the latest good $engine/$db backup is older than $max hours"; rc=1; }
+      [ "$configured" = 0 ] || [ "$off" = verified ] || { log "status: PROBLEM the latest good $engine/$db backup has no verified off-host copy"; rc=1; }
+    fi
+  done
+  [ "$rc" = 0 ] || die 1 "status: problems found, see above"
+  log "status: ok"
 }
 
 cmd_up() {
@@ -627,7 +735,8 @@ usage: reentry <command>
   backup   dump both databases to backups/ with SHA-256 checksums
   verify   restore the latest backups into throwaway containers and check them
   prune    apply retention (7 daily, 4 weekly, 6 monthly), add --dry-run to preview
-  list     show backups with size and checksum state
+  list     show backups with size, checksum state and off-host state
+  status   latest good backup, age and off-host state per engine, from the catalog (--refresh re-hashes)
   restore  <mysql|postgres> [--backup FILE] [--target CONTAINER] [--database NAME] [--yes]
            restore the latest (or a named) backup into a running container, asks first
 EOF
@@ -635,13 +744,14 @@ EOF
 
 case "${1:-}" in
   -h|--help|help) usage; exit 0 ;;
-  up|down|backup|verify|prune|list|restore|_backup-engine|_verify-engine) ;;
+  up|down|backup|verify|prune|list|status|restore|_backup-engine|_verify-engine) ;;
   *) usage; exit 2 ;;
 esac
 
 need_tools
 parse_env
 BACKUP_DIR="${REENTRY_BACKUP_DIR:-$ROOT/backups}"
+CATALOG="$BACKUP_DIR/.catalog.tsv"
 
 case "$1" in
   up) cmd_up ;;
@@ -650,6 +760,7 @@ case "$1" in
   verify) cmd_verify ;;
   prune) cmd_prune "${2:-}" ;;
   list) cmd_list ;;
+  status) cmd_status "${2:-}" ;;
   restore) cmd_restore "${@:2}" ;;
   _backup-engine) cmd_backup_engine "${2:?engine}" ;;
   _verify-engine) cmd_verify_engine "${2:?engine}" ;;

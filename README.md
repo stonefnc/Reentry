@@ -21,7 +21,8 @@ cp .env.example .env     # then set the passwords
 ./reentry up             # start MySQL and PostgreSQL
 ./reentry backup         # dump both databases into backups/
 ./reentry verify         # restore the latest backups and check them
-./reentry list           # backups with size and checksum state
+./reentry list           # backups with size, checksum state and off-host state
+./reentry status         # latest good backup, age and off-host state per engine
 ./reentry restore mysql  # restore the latest backup into a running container (asks first)
 ./reentry prune          # apply retention (add --dry-run to preview)
 ./reentry down           # stop and delete the data volumes (asks first, or pass --yes)
@@ -109,6 +110,35 @@ integrity checks:
 The throwaway container is removed on exit. `verify` exits non-zero if either
 engine fails.
 
+### status and the catalog
+
+```
+./reentry status [--refresh]
+```
+
+`backup` and `prune` keep a small catalog, `backups/.catalog.tsv`, next to the
+backups. It is tab separated with one row per backup: file name, size, mtime,
+checksum state (`ok`, `mismatch` or `none`), when that was checked, off-host
+state (`verified`, `failed` or `none`) and when that was set. It is written
+through a temporary file under the same lock as the other commands, and a
+failure to write it only logs a warning. `list` shows the off-host state from it.
+
+`status` needs no Docker. It reads the catalog and prints one line per engine
+with the latest good backup, its age, the off-host state and how many backups
+there are and how many are bad. It exits 1 and logs a `PROBLEM` line when an
+engine has no good backup, when its newest backup fails its checksum, when the
+latest good backup is older than `REENTRY_MAX_AGE_HOURS` (default 48), or when
+`REENTRY_OFFHOST_DEST` is set and that backup has no verified off-host copy.
+Without a catalog it exits 1 and says how to create one. A bad option or a bad
+`REENTRY_MAX_AGE_HOURS` exits 2.
+
+The catalog is a cache. To keep `backup` and `prune` quick, a row whose size and
+mtime are unchanged and was `ok` is not hashed again, so damage that keeps the
+size and mtime goes unnoticed until `./reentry status --refresh`, which hashes
+every backup and rewrites the catalog. `status` warns when the files in the
+folder and the catalog disagree. The off-host state is what Reentry last
+recorded. It is not a live check of the destination.
+
 ### restore
 
 ```
@@ -161,7 +191,7 @@ also removes orphan sidecars and leftover `.partial` files.
 settings from `.env`, and it never runs the file as shell code. A value
 already in the environment wins. Quote values that contain `$` with single
 quotes. Inline comments are not supported. `REENTRY_BACKUP_DIR` moves the
-backup folder, and one `backup`, `verify`, `restore` or `prune` runs at a time (a lock
+backup folder, and one `backup`, `verify`, `restore`, `prune` or `status --refresh` runs at a time (a lock
 file in that folder).
 
 ### Exit codes
@@ -169,7 +199,7 @@ file in that folder).
 | Code | Meaning |
 |---|---|
 | 0 | ok |
-| 1 | the command failed, a check failed (an off-host copy that fails counts), or `list` found no backups or a bad checksum |
+| 1 | the command failed, a check failed (an off-host copy that fails counts), `list` found no backups or a bad checksum, or `status` found a problem |
 | 2 | usage error or bad setting (for `restore`, also a missing `--yes` when there is no terminal) |
 | 3 | prerequisite missing (Docker, a tool, or a container not running) |
 
@@ -204,6 +234,7 @@ written to be followed under pressure.
 | Encryption (`gpg`, `openssl`) | written, logic tested against a fake `docker` with the real `gpg` and `openssl`, not run against real Docker |
 | Off-host copy (folder and rsync/ssh) | written, logic tested against a fake `docker`, `rsync` and `ssh`, not run against real Docker, a real ssh host or a real share |
 | `prune`, `list` | built and tested, no Docker needed |
+| `status` and the backup catalog | written, tested against the fake `docker`, no Docker needed to run it |
 | Runbook | written, restore commands not run |
 | End-to-end test (`test/e2e.sh`) | written, not run (needs Docker) |
 
@@ -215,7 +246,7 @@ the corruption test fails verify as expected. That has not been shown yet.
 | Command | Needs Docker | Result so far |
 |---|---|---|
 | `bash test/prune.sh` | no | 18 checks passed under WSL bash |
-| `bash test/fake.sh` | no | 118 checks passed under WSL bash (uses the installed `gpg` and `openssl`, and skips a tool that is missing) |
+| `bash test/fake.sh` | no | 148 checks passed under WSL bash (uses the installed `gpg` and `openssl`, and skips a tool that is missing) |
 | `bash test/e2e.sh` | yes | not run, only its syntax and the Docker-missing exit were checked |
 
 `test/e2e.sh` starts the sample databases if needed, takes a real backup in a

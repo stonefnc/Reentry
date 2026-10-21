@@ -45,6 +45,9 @@ run "$good" verify
 check "verify passes on an untouched backup" [ "$rc" = 0 ]
 [ "$rc" = 0 ] || cat "$tmp/out"
 
+run "$good" status
+check "status reports the fresh backups as healthy" [ "$rc" = 0 ]
+
 # control: a plain copy must still pass, so a failure below is down to the damage and not the copy
 cp -r "$good" "$tmp/control"
 run "$tmp/control" verify
@@ -57,6 +60,8 @@ printf 'garbage' >> "$tmp/a/$my"
 run "$tmp/a" verify
 check "A: corrupted dump makes verify exit non-zero" [ "$rc" != 0 ]
 check "A: the failure is the checksum" has "SHA-256 mismatch"
+run "$tmp/a" status --refresh
+check "A: status --refresh reports the damaged backup" [ "$rc" = 1 ]
 
 # B. one row removed from the PostgreSQL dump, checksum files rewritten so they match
 cp -r "$good" "$tmp/b"
