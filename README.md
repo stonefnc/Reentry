@@ -119,7 +119,7 @@ written to be followed under pressure.
 | `backup`, `verify` | written, logic tested against a fake `docker`, not run against real Docker |
 | `prune`, `list` | built and tested, no Docker needed |
 | Runbook | written, restore commands not run |
-| End-to-end test (`test/e2e.sh`) | planned |
+| End-to-end test (`test/e2e.sh`) | written, not run (needs Docker) |
 
 Done when `./reentry up && ./reentry backup && ./reentry verify` succeeds and
 the corruption test fails verify as expected. That has not been shown yet.
@@ -130,6 +130,15 @@ the corruption test fails verify as expected. That has not been shown yet.
 |---|---|---|
 | `bash test/prune.sh` | no | 18 checks passed under WSL bash |
 | `bash test/fake.sh` | no | 21 checks passed under WSL bash |
+| `bash test/e2e.sh` | yes | not run, only its syntax and the Docker-missing exit were checked |
+
+`test/e2e.sh` starts the sample databases if needed, takes a real backup in a
+temporary folder and checks that `verify` passes. It then damages copies of the
+backup two ways and expects `verify` to fail each time. In case A the dump is
+corrupted, and the SHA-256 check catches it. In case B a row is removed from the
+PostgreSQL dump and the checksum files are rewritten to match, so only the
+restore and the row count comparison can catch it. It tears Docker down at the
+end if it started it, unless `E2E_KEEP_UP=1` is set.
 
 `test/fake.sh` uses a stand-in `docker` command (`test/fake-docker/`) that
 returns canned dumps and counts. It checks the script's own logic: file
