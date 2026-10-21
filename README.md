@@ -90,7 +90,7 @@ If the copy fails or does not match, the bad copy is removed from the
 destination, the run logs an error, and `backup` exits 1. The local backup is
 never touched by an off-host failure. The destination may only contain letters,
 digits and `_ . / @ : + -`, and may not be the backup folder itself.
-`prune` works on the local folder only and does not delete off-host copies.
+`prune` also applies retention to the off-host copies, see below.
 
 ### verify
 
@@ -209,6 +209,27 @@ numbers. The newest backup of a group is never deleted, even if every limit is
 alone and prune exits 1, so a corrupt backup cannot push good ones out. Prune
 also removes orphan sidecars and leftover `.partial` files.
 
+When `REENTRY_OFFHOST_DEST` is set, `prune` then applies the same retention to
+the off-host copies, separately from the local folder, with
+`REENTRY_OFFHOST_KEEP_DAILY`, `REENTRY_OFFHOST_KEEP_WEEKLY` and
+`REENTRY_OFFHOST_KEEP_MONTHLY` (each defaults to the local value). The guards:
+
+- The newest copy of each engine and database is never deleted, even with every
+  limit at 0, so the last good copy is always kept.
+- If the newest copy of a group fails its SHA-256 check at the destination, the
+  group is left alone and `prune` exits 1.
+- If the destination cannot be read (a missing folder, an unmounted share, ssh
+  failing), nothing is deleted and `prune` exits 1. An unreadable destination
+  is never treated as an empty one.
+- `--dry-run` only logs what would be deleted.
+
+A deleted off-host copy is recorded in the catalog as no longer off-host, so
+`status` stops counting it. The local backups are not touched by off-host
+retention. `prune` does not clean orphan or `.partial` files at the destination.
+Delete access to the destination is needed for this, which conflicts with a
+destination the database host cannot delete from. If that is your setup, leave
+off-host pruning to the storage side and keep `REENTRY_OFFHOST_KEEP_*` large.
+
 ### Settings
 
 `reentry` reads only `MYSQL_DATABASE`, `POSTGRES_DB` and the `REENTRY_*`
@@ -258,6 +279,7 @@ written to be followed under pressure.
 | Encryption (`gpg`, `openssl`) | written, logic tested against a fake `docker` with the real `gpg` and `openssl`, not run against real Docker |
 | Off-host copy (folder and rsync/ssh) | written, logic tested against a fake `docker`, `rsync` and `ssh`, not run against real Docker, a real ssh host or a real share |
 | `prune`, `list` | built and tested, no Docker needed |
+| Off-host retention in `prune` | written, tested against the fake `docker`, `ssh` and a local folder, not run against a real ssh host or share |
 | Failure notices (command and webhook) | written, tested against the fake `docker` and a fake `curl`, no real mail system or webhook has been called |
 | `status` and the backup catalog | written, tested against the fake `docker`, no Docker needed to run it |
 | Runbook | written, restore commands not run |
@@ -271,7 +293,7 @@ the corruption test fails verify as expected. That has not been shown yet.
 | Command | Needs Docker | Result so far |
 |---|---|---|
 | `bash test/prune.sh` | no | 18 checks passed under WSL bash |
-| `bash test/fake.sh` | no | 174 checks passed under WSL bash (uses the installed `gpg` and `openssl`, and skips a tool that is missing) |
+| `bash test/fake.sh` | no | 197 checks passed under WSL bash (uses the installed `gpg` and `openssl`, and skips a tool that is missing) |
 | `bash test/e2e.sh` | yes | not run, only its syntax and the Docker-missing exit were checked |
 
 `test/e2e.sh` starts the sample databases if needed, takes a real backup in a

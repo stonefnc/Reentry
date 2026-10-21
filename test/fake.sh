@@ -358,6 +358,65 @@ check "webhook: a URL that is not http or https is refused with a warning" has "
 check "webhook: and the exit code is kept" [ "$rc" = 1 ]
 unset REENTRY_NOTIFY_WEBHOOK
 
+# off-host retention
+mkcopy() { # mkcopy <dir> <engine> <stamp>: a small fake backup with a valid checksum file
+  local n="${2}_shop_${3}.sql.gz"
+  printf 'x' > "$1/$n"
+  (cd "$1" && sha256sum "$n" > "$n.sha256")
+}
+offcount() { ls "$1" | grep -c '\.sql\.gz$'; }
+export REENTRY_OFFHOST_KEEP_DAILY=1 REENTRY_OFFHOST_KEEP_WEEKLY=0 REENTRY_OFFHOST_KEEP_MONTHLY=0
+
+fresh r1; off="$tmp/off-r1"; mkdir -p "$off" "$REENTRY_BACKUP_DIR"
+mkcopy "$off" mysql 20260101T000000Z; mkcopy "$off" mysql 20260102T000000Z; mkcopy "$off" mysql 20260103T000000Z
+mkcopy "$off" postgres 20260101T000000Z
+REENTRY_OFFHOST_DEST="$off" run prune --dry-run
+check "off-host dry run exits 0" [ "$rc" = 0 ]
+check "off-host dry run names what it would delete" has "prune off-host: would delete mysql_shop_20260101"
+check "off-host dry run deletes nothing" [ "$(offcount "$off")" = 4 ]
+REENTRY_OFFHOST_DEST="$off" run prune
+check "off-host prune exits 0" [ "$rc" = 0 ]
+check "off-host prune keeps the newest copy of each group" [ "$(ls "$off" | grep -c 'mysql_shop_20260103.*gz$\|postgres_shop_20260101.*gz$')" = 2 ]
+check "older off-host copies are deleted" [ "$(offcount "$off")" = 2 ]
+check "their sidecars go with them" [ "$(ls "$off" | grep -c sha256)" = 2 ]
+check "a single remaining copy is kept even with every limit at 0" bash -c "REENTRY_OFFHOST_KEEP_DAILY=0 REENTRY_BACKUP_DIR='$REENTRY_BACKUP_DIR' REENTRY_OFFHOST_DEST='$off' '$ROOT/reentry' prune >/dev/null 2>&1 && [ \$(ls '$off' | grep -c '\.sql\.gz\$') = 2 ]"
+
+fresh r2; off="$tmp/off-r2"; mkdir -p "$off" "$REENTRY_BACKUP_DIR"
+mkcopy "$off" mysql 20260101T000000Z; mkcopy "$off" mysql 20260102T000000Z
+printf x >> "$off/mysql_shop_20260102T000000Z.sql.gz"
+REENTRY_OFFHOST_DEST="$off" run prune
+check "a newest off-host copy that fails its checksum makes prune exit 1" [ "$rc" = 1 ]
+check "the failure is named" has "prune off-host: newest backup mysql_shop_20260102.* fails its checksum"
+check "and the whole group is left alone" [ "$(offcount "$off")" = 2 ]
+
+fresh r3
+REENTRY_OFFHOST_DEST="$tmp/not-mounted" run prune
+check "an unreadable off-host folder makes prune exit 1" [ "$rc" = 1 ]
+check "and says it was left untouched" has "cannot read"
+check "the folder is not created" [ ! -e "$tmp/not-mounted" ]
+
+fresh r4; off="$tmp/off-r4"; mkdir -p "$off"
+mkcopy "$off" mysql 20260101T000000Z; mkcopy "$off" mysql 20260102T000000Z
+REENTRY_OFFHOST_DEST="fakehost:$off" run prune
+check "off-host retention works over the remote path too" [ "$rc" = 0 ]
+check "the older remote copy is deleted and the newest kept" [ "$(ls "$off" | grep -c '20260102.*gz$')" = 1 ] 
+check "only one remote dump is left" [ "$(offcount "$off")" = 1 ]
+
+fresh r5; off="$tmp/off-r5"; mkdir -p "$off"
+REENTRY_OFFHOST_DEST="$off" run backup
+check "catalog: both backups start as verified off-host" [ "$(cut -f6 "$REENTRY_BACKUP_DIR/.catalog.tsv" | grep -c '^verified$')" = 2 ]
+mkcopy "$off" mysql 20990101T000000Z
+REENTRY_OFFHOST_KEEP_DAILY=0 REENTRY_OFFHOST_DEST="$off" run prune
+check "the real backup's mysql copy is pruned off-host by the newer copy" [ "$(ls "$off" | grep -c '^mysql_shop_2026')" = 0 ]
+check "the local backups are untouched by off-host retention" [ "$(files '\.sql\.gz$')" = 2 ]
+check "the catalog now shows that backup as no longer off-host" [ "$(grep '^mysql' "$REENTRY_BACKUP_DIR/.catalog.tsv" | cut -f6)" = none ]
+check "the postgres copy is still recorded as verified" [ "$(grep '^postgres' "$REENTRY_BACKUP_DIR/.catalog.tsv" | cut -f6)" = verified ]
+
+fresh r6
+REENTRY_OFFHOST_KEEP_DAILY=abc run prune
+check "a bad off-host retention value exits 2" [ "$rc" = 2 ]
+unset REENTRY_OFFHOST_KEEP_DAILY REENTRY_OFFHOST_KEEP_WEEKLY REENTRY_OFFHOST_KEEP_MONTHLY
+
 fresh e
 check "list exits 1 on an empty folder" bash -c "! '$ROOT/reentry' list"
 

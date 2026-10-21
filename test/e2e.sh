@@ -48,6 +48,16 @@ check "verify passes on an untouched backup" [ "$rc" = 0 ]
 run "$good" status
 check "status reports the fresh backups as healthy" [ "$rc" = 0 ]
 
+# off-host copy and its retention, against a plain folder
+off="$tmp/offhost"; mkdir -p "$off"
+REENTRY_OFFHOST_DEST="$off" run "$tmp/offbackups" backup
+check "backup with an off-host folder succeeds" [ "$rc" = 0 ]
+check "both dumps are copied and verified off-host" [ "$(ls "$off" | grep -c '\.sql\.gz$')" = 2 ]
+REENTRY_OFFHOST_DEST="$off" run "$tmp/offbackups" status
+check "status reports the verified off-host copies" [ "$rc" = 0 ]
+REENTRY_OFFHOST_DEST="$off" REENTRY_OFFHOST_KEEP_DAILY=0 REENTRY_OFFHOST_KEEP_WEEKLY=0 REENTRY_OFFHOST_KEEP_MONTHLY=0 run "$tmp/offbackups" prune
+check "off-host prune keeps the only copy of each engine" [ "$(ls "$off" | grep -c '\.sql\.gz$')" = 2 ]
+
 # control: a plain copy must still pass, so a failure below is down to the damage and not the copy
 cp -r "$good" "$tmp/control"
 run "$tmp/control" verify

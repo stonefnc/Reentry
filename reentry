@@ -134,15 +134,23 @@ dump_to() {
   esac
 }
 
-# backup_index: "key<TAB>file" for every backup, newest first within each key (engine_database)
-backup_index() {
-  local f n
-  for f in "$BACKUP_DIR"/*.sql.gz "$BACKUP_DIR"/*.sql.gz.enc; do
-    [ -e "$f" ] || continue
-    n="${f##*/}"
+# index_names: reads file names on stdin and prints "key<TAB>file" for each backup, newest first
+# within each key (engine_database)
+index_names() {
+  local n
+  while IFS= read -r n; do
     [[ $n =~ $BACKUP_RE ]] || continue
     printf '%s\t%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$n"
   done | LC_ALL=C sort -t $'\t' -k1,1 -k2,2r | cut -f1,3
+}
+
+# backup_index: the same for the files in the backup folder
+backup_index() {
+  local f
+  for f in "$BACKUP_DIR"/*.sql.gz "$BACKUP_DIR"/*.sql.gz.enc; do
+    [ -e "$f" ] || continue
+    printf '%s\n' "${f##*/}"
+  done | index_names
 }
 
 latest_backup() {
@@ -646,14 +654,20 @@ cmd_restore() {
   log "$label: done, $name is in database $rdb on $target"
 }
 
+# What prune_group checks and removes. Locally these are checksum_ok and local_rm. For the
+# off-host copies prune_offhost points them at off_check and off_rm.
+PRUNE_OK=checksum_ok PRUNE_RM=local_rm PRUNE_LABEL=prune
+local_rm() { rm -f -- "$BACKUP_DIR/$1" "$BACKUP_DIR/$1.sha256" "$BACKUP_DIR/$1.counts"; }
+
 # Keeps the newest backup of each of the last N days, ISO weeks and months that have one.
-# Returns 1 and leaves the group alone if its newest backup fails its checksum.
+# Returns 1 and leaves the group alone if its newest backup fails its checksum, so a group
+# always keeps at least one good copy.
 prune_group() {
   local dry=$1 keep_d=$2 keep_w=$3 keep_m=$4; shift 4
   local f stamp day week month nd=0 nw=0 nm=0 keep
   declare -A sd sw sm
-  if ! checksum_ok "$1"; then
-    log "ERROR: prune: newest backup $1 fails its checksum, leaving its group untouched"
+  if ! "$PRUNE_OK" "$1"; then
+    log "ERROR: $PRUNE_LABEL: newest backup $1 fails its checksum, leaving its group untouched"
     return 1
   fi
   for f in "$@"; do
@@ -666,12 +680,12 @@ prune_group() {
     if [ -z "${sw[$week]:-}" ] && [ "$nw" -lt "$keep_w" ]; then sw[$week]=1; nw=$((nw+1)); keep=1; fi
     if [ -z "${sm[$month]:-}" ] && [ "$nm" -lt "$keep_m" ]; then sm[$month]=1; nm=$((nm+1)); keep=1; fi
     if [ "$keep" = 1 ]; then
-      log "prune: keep $f"
+      log "$PRUNE_LABEL: keep $f"
     elif [ "$dry" = 1 ]; then
-      log "prune: would delete $f"
+      log "$PRUNE_LABEL: would delete $f"
     else
-      rm -f -- "$BACKUP_DIR/$f" "$BACKUP_DIR/$f.sha256" "$BACKUP_DIR/$f.counts"
-      log "prune: deleted $f"
+      "$PRUNE_RM" "$f"
+      log "$PRUNE_LABEL: deleted $f"
     fi
   done
 }
@@ -686,15 +700,10 @@ prune_orphans() {
   done
 }
 
-cmd_prune() {
-  local dry=0 d w m n key last="" rc=0
-  case "${1:-}" in --dry-run) dry=1 ;; "") ;; *) die 2 "prune: unknown option $1" ;; esac
-  d="${REENTRY_KEEP_DAILY:-7}"; w="${REENTRY_KEEP_WEEKLY:-4}"; m="${REENTRY_KEEP_MONTHLY:-6}"
-  for n in "$d" "$w" "$m"; do
-    [[ $n =~ ^[0-9]+$ ]] || die 2 "prune: retention values must be whole numbers, got '$n'"
-  done
-  take_lock
-  log "prune: keeping $d daily, $w weekly, $m monthly (dry run: $dry)"
+# prune_index <dry> <daily> <weekly> <monthly>: applies retention to "key<TAB>file" lines on stdin,
+# one group (engine and database) at a time. Returns 1 if any group was left alone.
+prune_index() {
+  local dry=$1 d=$2 w=$3 m=$4 key n last="" rc=0
   local -a group=()
   while IFS=$'\t' read -r key n; do
     if [ -n "$last" ] && [ "$key" != "$last" ]; then
@@ -702,9 +711,61 @@ cmd_prune() {
       group=()
     fi
     group+=("$n"); last="$key"
-  done < <(backup_index)
+  done
   if [ "${#group[@]}" -gt 0 ]; then prune_group "$dry" "$d" "$w" "$m" "${group[@]}" || rc=1; fi
+  return "$rc"
+}
+
+# off_check <file name>: the copy at the off-host destination passes its SHA-256 file there
+off_check() {
+  case "$OFFHOST_KIND" in
+    path) [ -f "$OFFHOST_PATH/$1.sha256" ] && (cd "$OFFHOST_PATH" && sha256sum -c --status "$1.sha256" 2>/dev/null) ;;
+    remote) ssh "$OFFHOST_HOST" "cd '$OFFHOST_PATH' && sha256sum -c --status '$1.sha256'" >/dev/null 2>&1 ;;
+  esac
+}
+
+# off_rm <file name>: removes one off-host copy and records that in the catalog
+off_rm() { offhost_discard "$1"; catalog_set_off "$1" none; }
+
+# offhost_list: file names at the destination. Fails if the destination cannot be read, which
+# must never be mistaken for an empty destination.
+offhost_list() {
+  case "$OFFHOST_KIND" in
+    path) [ -d "$OFFHOST_PATH" ] && ls -1 -- "$OFFHOST_PATH" ;;
+    remote) ssh "$OFFHOST_HOST" "ls -1 -- '$OFFHOST_PATH'" ;;
+  esac
+}
+
+# prune_offhost <dry> <daily> <weekly> <monthly>: the same retention on the off-host copies, only
+# when REENTRY_OFFHOST_DEST is set. A group whose newest copy fails its check there is left alone.
+prune_offhost() {
+  local listing r=0
+  [ "$OFFHOST_KIND" != none ] || return 0
+  log "prune: off-host retention at $REENTRY_OFFHOST_DEST, keeping $2 daily, $3 weekly, $4 monthly"
+  if ! listing="$(offhost_list 2>/dev/null)"; then
+    log "ERROR: prune: cannot read $REENTRY_OFFHOST_DEST, the off-host copies were left untouched"
+    return 1
+  fi
+  PRUNE_OK=off_check PRUNE_RM=off_rm PRUNE_LABEL="prune off-host"
+  printf '%s\n' "$listing" | index_names | prune_index "$@" || r=1
+  PRUNE_OK=checksum_ok PRUNE_RM=local_rm PRUNE_LABEL=prune
+  return "$r"
+}
+
+cmd_prune() {
+  local dry=0 d w m od ow om n rc=0
+  case "${1:-}" in --dry-run) dry=1 ;; "") ;; *) die 2 "prune: unknown option $1" ;; esac
+  d="${REENTRY_KEEP_DAILY:-7}"; w="${REENTRY_KEEP_WEEKLY:-4}"; m="${REENTRY_KEEP_MONTHLY:-6}"
+  od="${REENTRY_OFFHOST_KEEP_DAILY:-$d}"; ow="${REENTRY_OFFHOST_KEEP_WEEKLY:-$w}"; om="${REENTRY_OFFHOST_KEEP_MONTHLY:-$m}"
+  for n in "$d" "$w" "$m" "$od" "$ow" "$om"; do
+    [[ $n =~ ^[0-9]+$ ]] || die 2 "prune: retention values must be whole numbers, got '$n'"
+  done
+  offhost_setup
+  take_lock
+  log "prune: keeping $d daily, $w weekly, $m monthly (dry run: $dry)"
+  backup_index | prune_index "$dry" "$d" "$w" "$m" || rc=1
   prune_orphans "$dry"
+  prune_offhost "$dry" "$od" "$ow" "$om" || rc=1
   [ "$dry" = 1 ] || catalog_update
   [ "$rc" = 0 ] || die 1 "prune: finished with problems, see the errors above"
   log "prune: done"
