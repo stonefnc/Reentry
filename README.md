@@ -53,7 +53,7 @@ file is written and `verify` falls back to the live source with a warning.
 #### Encryption
 
 Opt-in. Set `REENTRY_ENCRYPT` to `gpg` (symmetric, AES256) or `openssl`
-(`aes-256-cbc` with `pbkdf2`) and `REENTRY_ENCRYPT_KEY_FILE` to a file whose
+(`aes-256-cbc` with `pbkdf2`, 600000 iterations by default) and `REENTRY_ENCRYPT_KEY_FILE` to a file whose
 first line is the passphrase. The passphrase is read from that file and never
 appears on a command line or in `.env`. Keep the file off the backup volume and
 off the off-host destination, restrict it with `chmod 600`, and keep a copy
@@ -73,6 +73,15 @@ A wrong key fails `verify` and
 folder. `.counts` files are not encrypted and hold table names and row counts.
 Reentry runs with umask 077, so every file it writes, including the plaintext
 dump before it is encrypted, is readable by its owner only.
+For `openssl`, `REENTRY_KDF_ITER` sets the PBKDF2 iteration count for new
+backups. It takes a whole number from 10000 to 100000000, anything else exits 2
+before a dump is taken. The count used is written to `<backup name>.kdf` (one
+line, `iter=600000`), which is listed in the `.sha256` file, copied off-host and
+pruned with the backup. `verify` and `restore` read the count from that file and
+ignore `REENTRY_KDF_ITER`, so changing the setting never breaks an older backup.
+A backup with no `.kdf` file was made before the count was recorded and is
+decrypted with the openssl default count, so old backups still restore.
+`gpg` backups are not affected.
 This protects backups at rest. It does not hide data from anyone who holds the
 key file, and the gpg and openssl tools are used as installed on your system.
 
@@ -297,7 +306,7 @@ the corruption test fails verify as expected. That has not been shown yet.
 | Command | Needs Docker | Result so far |
 |---|---|---|
 | `bash test/prune.sh` | no | 18 checks passed under WSL bash |
-| `bash test/fake.sh` | no | 217 checks passed under WSL bash (uses the installed `gpg` and `openssl`, and skips a tool that is missing) |
+| `bash test/fake.sh` | no | 246 checks passed under WSL bash (uses the installed `gpg` and `openssl`, and skips a tool that is missing) |
 | `bash test/e2e.sh` | yes | not run, only its syntax and the Docker-missing exit were checked |
 
 `test/e2e.sh` starts the sample databases if needed, takes a real backup in a

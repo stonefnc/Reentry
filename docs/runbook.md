@@ -110,10 +110,11 @@ If the backups end in `.enc` they are encrypted. Get the passphrase file from
 wherever it is kept (not from the backup storage) and put its path in
 `REENTRY_ENCRYPT_KEY_FILE`. `list`, the checksum check and `reentry restore` work
 with the file as it is. For the manual commands below, decrypt first. For an
-`openssl` file:
+`openssl` file, read the count from `FILE.sql.gz.enc.kdf` (it holds a line like
+`iter=600000`) and use it as `N`. If there is no `.kdf` file, leave out `-iter N`:
 
 ```
-openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/path/to/reentry.key -in FILE.sql.gz.enc -out FILE.sql.gz
+openssl enc -d -aes-256-cbc -pbkdf2 -iter N -pass file:/path/to/reentry.key -in FILE.sql.gz.enc -out FILE.sql.gz
 ```
 
 For a `gpg` file:

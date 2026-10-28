@@ -33,7 +33,7 @@ cleanup() {
     if [ "$rc" -ne 0 ] && [ "$rc" -lt 128 ]; then notify_failure "$NOTIFY_CTX" "$rc" || true; fi
     [ -z "${_REENTRY_FAILS:-}" ] || rm -f -- "$_REENTRY_FAILS"
   fi
-  [ -z "$CLEAN_BASE" ] || rm -f -- "$CLEAN_BASE.partial" "$CLEAN_BASE.plain.partial" "$CLEAN_BASE.counts" "$CLEAN_BASE.sha256"
+  [ -z "$CLEAN_BASE" ] || rm -f -- "$CLEAN_BASE.partial" "$CLEAN_BASE.plain.partial" "$CLEAN_BASE.counts" "$CLEAN_BASE.kdf" "$CLEAN_BASE.sha256"
   # the temporary catalog belongs to the run that holds the lock, a run that was refused it must leave it alone
   [ -z "${CATALOG:-}" ] || [ -z "$HAVE_LOCK" ] || rm -f -- "$CATALOG.tmp"
   [ "${#CLEAN_OFF[@]}" -eq 0 ] || rm -f -- "${CLEAN_OFF[@]}"
@@ -244,15 +244,25 @@ encrypt_setup() {
   esac
   command -v "$ENC_TOOL" >/dev/null 2>&1 || die 3 "$ENC_TOOL not found on PATH, it is needed for REENTRY_ENCRYPT=$ENC_TOOL"
   need_key
+  [ "$ENC_TOOL" != openssl ] || kdf_iter_setup
   if [ -n "$(find "$REENTRY_ENCRYPT_KEY_FILE" -maxdepth 0 -perm /077 2>/dev/null)" ]; then
     log "WARN $REENTRY_ENCRYPT_KEY_FILE can be read by other users, restrict it with chmod 600"
   fi
 }
 
+# kdf_iter_setup: sets KDF_ITER from REENTRY_KDF_ITER, the PBKDF2 iteration count for new openssl
+# backups. The count is written to the backup's .kdf file so restore never has to guess it.
+KDF_ITER=""
+kdf_iter_setup() {
+  KDF_ITER="${REENTRY_KDF_ITER:-600000}"
+  [[ $KDF_ITER =~ ^[0-9]+$ ]] && [ "${#KDF_ITER}" -le 9 ] && [ "$KDF_ITER" -ge 10000 ] && [ "$KDF_ITER" -le 100000000 ] ||
+    die 2 "REENTRY_KDF_ITER must be a whole number from 10000 to 100000000, got '$KDF_ITER'"
+}
+
 # encrypt_stream: encrypts stdin to stdout with the configured tool
 encrypt_stream() {
   case "$ENC_TOOL" in
-    openssl) openssl enc -aes-256-cbc -pbkdf2 -salt -pass "file:$REENTRY_ENCRYPT_KEY_FILE" ;;
+    openssl) openssl enc -aes-256-cbc -pbkdf2 -iter "$KDF_ITER" -salt -pass "file:$REENTRY_ENCRYPT_KEY_FILE" ;;
     gpg) gpg --batch --quiet --yes --pinentry-mode loopback --passphrase-file "$REENTRY_ENCRYPT_KEY_FILE" \
       --symmetric --cipher-algo AES256 --compress-algo none -o - ;;
   esac
@@ -266,7 +276,16 @@ read_backup() {
     *.enc)
       need_key
       if head -c 8 -- "$f" | grep -aqx 'Salted__'; then
-        openssl enc -d -aes-256-cbc -pbkdf2 -pass "file:$REENTRY_ENCRYPT_KEY_FILE" -in "$f"
+        local -a iter=()
+        # a backup made before the count was recorded has no .kdf file and used the openssl default
+        if [ -f "$f.kdf" ]; then
+          local n="" l=""
+          IFS= read -r l < "$f.kdf" || true
+          [[ $l =~ ^iter=([0-9]{1,9})$ ]] && n="${BASH_REMATCH[1]}"
+          [ -n "$n" ] || { log "ERROR: $1.kdf is not valid, expected a line like iter=600000"; return 1; }
+          iter=(-iter "$n")
+        fi
+        openssl enc -d -aes-256-cbc -pbkdf2 ${iter[@]+"${iter[@]}"} -pass "file:$REENTRY_ENCRYPT_KEY_FILE" -in "$f"
       else
         gpg --batch --quiet --pinentry-mode loopback --passphrase-file "$REENTRY_ENCRYPT_KEY_FILE" -d "$f"
       fi ;;
@@ -349,7 +368,7 @@ offhost_setup() {
 # offhost_discard <file name>: best effort removal of a copy that failed its check
 offhost_discard() {
   local f
-  for f in "$1" "$1.counts" "$1.sha256"; do
+  for f in "$1" "$1.counts" "$1.kdf" "$1.sha256"; do
     case "$OFFHOST_KIND" in
       path) rm -f -- "$OFFHOST_PATH/$f" ;;
       remote) ssh "$OFFHOST_HOST" "rm -f -- '$OFFHOST_PATH/$f'" </dev/null >/dev/null 2>&1 || true ;;
@@ -367,6 +386,7 @@ offhost_copy() {
     return 0
   fi
   [ ! -f "$BACKUP_DIR/$name.counts" ] || files+=("$name.counts")
+  [ ! -f "$BACKUP_DIR/$name.kdf" ] || files+=("$name.kdf")
   files+=("$name.sha256")
   case "$OFFHOST_KIND" in
     path)
@@ -390,7 +410,7 @@ offhost_copy() {
 
 # Runs in its own process (see cmd_backup) so one engine failing never stops the other.
 cmd_backup_engine() {
-  local engine=$1 db src stamp name base plain marker before after after_tail hash manifest=0
+  local engine=$1 db src stamp name base plain marker before after after_tail hash manifest=0 kdf=0
   need_docker; load_env; engine_setup "$engine"; encrypt_setup; offhost_setup
   require_running "$src"
   case "$engine" in mysql) marker='Dump completed' ;; postgres) marker='dump complete' ;; esac
@@ -422,11 +442,15 @@ cmd_backup_engine() {
     rm -f -- "$plain"
   fi
 
+  if [ "$ENC_TOOL" = openssl ]; then printf 'iter=%s
+' "$KDF_ITER" > "$base.kdf"; kdf=1; fi
+
   # sidecar first, dump last: a crash leaves at worst an orphan sidecar, never a backup without one
   hash="$(sha256sum < "$base.partial" | cut -d' ' -f1)"
   {
     printf '%s  %s\n' "$hash" "$name"
     if [ "$manifest" = 1 ]; then (cd "$BACKUP_DIR" && sha256sum "$name.counts"); fi
+    if [ "$kdf" = 1 ]; then (cd "$BACKUP_DIR" && sha256sum "$name.kdf"); fi
   } > "$base.sha256"
   mv "$base.partial" "$base"
   CLEAN_BASE=""
@@ -671,7 +695,7 @@ cmd_restore() {
 # What prune_group checks and removes. Locally these are checksum_ok and local_rm. For the
 # off-host copies prune_offhost points them at off_check and off_rm.
 PRUNE_OK=checksum_ok PRUNE_RM=local_rm PRUNE_LABEL=prune
-local_rm() { rm -f -- "$BACKUP_DIR/$1" "$BACKUP_DIR/$1.sha256" "$BACKUP_DIR/$1.counts"; }
+local_rm() { rm -f -- "$BACKUP_DIR/$1" "$BACKUP_DIR/$1.sha256" "$BACKUP_DIR/$1.counts" "$BACKUP_DIR/$1.kdf"; }
 
 # Keeps the newest backup of each of the last N days, ISO weeks and months that have one.
 # Returns 1 and leaves the group alone if its newest backup fails its checksum, so a group
@@ -707,7 +731,7 @@ prune_group() {
 # Removes sidecars with no backup and leftover .partial files. Safe because the lock is held.
 prune_orphans() {
   local dry=$1 f
-  for f in "$BACKUP_DIR"/*.sql.gz{,.enc}.{sha256,counts,partial} "$BACKUP_DIR"/*.sql.gz{,.enc}.plain.partial; do
+  for f in "$BACKUP_DIR"/*.sql.gz{,.enc}.{sha256,counts,kdf,partial} "$BACKUP_DIR"/*.sql.gz{,.enc}.plain.partial; do
     [ -e "$f" ] || continue
     case "$f" in *.partial) ;; *) [ ! -e "${f%.*}" ] || continue ;; esac
     if [ "$dry" = 1 ]; then log "prune: would delete orphan ${f##*/}"; else rm -f -- "$f"; log "prune: deleted orphan ${f##*/}"; fi

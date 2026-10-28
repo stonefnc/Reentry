@@ -228,6 +228,75 @@ for tool in openssl gpg; do
   check "$tool: both encrypted backups are still there after prune" [ "$(files '\.sql\.gz\.enc$')" = 2 ]
 done
 
+# openssl key derivation: the iteration count is explicit, recorded per backup and honoured on restore
+if command -v openssl >/dev/null 2>&1; then
+  fresh kdf; off="$tmp/off-kdf"; mkdir -p "$off"
+  REENTRY_ENCRYPT=openssl REENTRY_ENCRYPT_KEY_FILE="$tmp/key" REENTRY_OFFHOST_DEST="$off" run backup
+  check "kdf: default backup exits 0" [ "$rc" = 0 ]
+  check "kdf: each encrypted backup has a .kdf file" [ "$(files '\.enc\.kdf$')" = 2 ]
+  kdf_my="$(ls "$REENTRY_BACKUP_DIR" | grep '^mysql.*\.enc\.kdf$')"
+  check "kdf: the default count is 600000" [ "$(cat "$REENTRY_BACKUP_DIR/$kdf_my")" = "iter=600000" ]
+  check "kdf: the .kdf file is covered by the checksum file" grep -q '\.kdf$' "$REENTRY_BACKUP_DIR/${kdf_my%.kdf}.sha256"
+  check "kdf: the .kdf files are copied off-host" [ "$(ls "$off" | grep -c '\.enc\.kdf$')" = 2 ]
+  REENTRY_ENCRYPT_KEY_FILE="$tmp/key" REENTRY_KDF_ITER=12345 run verify
+  check "kdf: restore side ignores REENTRY_KDF_ITER and uses the recorded count" [ "$rc" = 0 ]
+
+  fresh kdf2
+  REENTRY_ENCRYPT=openssl REENTRY_ENCRYPT_KEY_FILE="$tmp/key" REENTRY_KDF_ITER=20000 run backup
+  check "kdf: a custom count backs up" [ "$rc" = 0 ]
+  kdf_my="$(ls "$REENTRY_BACKUP_DIR" | grep '^mysql.*\.enc\.kdf$')"
+  check "kdf: the custom count is recorded" [ "$(cat "$REENTRY_BACKUP_DIR/$kdf_my")" = "iter=20000" ]
+  REENTRY_ENCRYPT_KEY_FILE="$tmp/key" run verify
+  check "kdf: a custom count verifies with no setting" [ "$rc" = 0 ]
+  enc_my="${kdf_my%.kdf}"
+  check "kdf: the file really uses the recorded count" bash -c "openssl enc -d -aes-256-cbc -pbkdf2 -iter 20000 -pass file:'$tmp/key' -in '$REENTRY_BACKUP_DIR/$enc_my' | gzip -t"
+  resum() { (cd "$REENTRY_BACKUP_DIR" && { sha256sum "$enc_my"; [ ! -f "$enc_my.counts" ] || sha256sum "$enc_my.counts"; [ ! -f "$enc_my.kdf" ] || sha256sum "$enc_my.kdf"; } > "$enc_my.sha256"); }
+  printf 'iter=30000
+' > "$REENTRY_BACKUP_DIR/$kdf_my"
+  REENTRY_ENCRYPT_KEY_FILE="$tmp/key" run verify
+  check "kdf: an edited .kdf file fails the checksum" [ "$rc" = 1 ]
+  resum
+  REENTRY_ENCRYPT_KEY_FILE="$tmp/key" run verify
+  check "kdf: a wrong recorded count fails as a decrypt problem" [ "$rc" = 1 ]
+  printf 'garbage
+' > "$REENTRY_BACKUP_DIR/$kdf_my"; resum
+  REENTRY_ENCRYPT_KEY_FILE="$tmp/key" run verify
+  check "kdf: an unreadable .kdf file fails with exit 1" [ "$rc" = 1 ]
+  check "kdf: and the .kdf file is named" has "kdf is not valid"
+
+  # a backup made before the count was recorded: openssl default count, no .kdf file
+  rm -f "$REENTRY_BACKUP_DIR/$kdf_my"
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 20000 -pass file:"$tmp/key" -in "$REENTRY_BACKUP_DIR/$enc_my" |
+    openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:"$tmp/key" > "$tmp/legacy.enc"
+  mv "$tmp/legacy.enc" "$REENTRY_BACKUP_DIR/$enc_my"
+  (cd "$REENTRY_BACKUP_DIR" && { sha256sum "$enc_my"; [ ! -f "$enc_my.counts" ] || sha256sum "$enc_my.counts"; } > "$enc_my.sha256")
+  REENTRY_ENCRYPT_KEY_FILE="$tmp/key" run verify
+  check "kdf: a legacy openssl backup with no .kdf file still verifies" [ "$rc" = 0 ]
+  : > "$FAKE_LOG"
+  REENTRY_ENCRYPT_KEY_FILE="$tmp/key" run restore mysql --target reentry-empty-legacy --yes
+  check "kdf: a legacy openssl backup still restores" [ "$rc" = 0 ]
+  check "kdf: the legacy dump reached the target" grep -qx "load reentry-empty-legacy" "$FAKE_LOG"
+
+  fresh kdf3
+  for bad in abc 0 9999 12.5 -5 1000000000; do
+    REENTRY_ENCRYPT=openssl REENTRY_ENCRYPT_KEY_FILE="$tmp/key" REENTRY_KDF_ITER=$bad run backup
+    check "kdf: REENTRY_KDF_ITER=$bad is refused with exit 2" [ "$rc" = 2 ]
+  done
+  check "kdf: the refusal names the setting" has "REENTRY_KDF_ITER"
+  check "kdf: and no backup is taken" [ ! -e "$REENTRY_BACKUP_DIR" ]
+  REENTRY_ENCRYPT=gpg REENTRY_ENCRYPT_KEY_FILE="$tmp/key" REENTRY_KDF_ITER=abc run backup
+  check "kdf: gpg ignores REENTRY_KDF_ITER" [ "$rc" = 0 ]
+  check "kdf: gpg backups have no .kdf file" [ "$(files '\.kdf$')" = 0 ]
+
+  fresh kdf4
+  REENTRY_ENCRYPT=openssl REENTRY_ENCRYPT_KEY_FILE="$tmp/key" run backup
+  printf 'iter=1
+' > "$REENTRY_BACKUP_DIR/mysql_shop_20200101T000000Z.sql.gz.enc.kdf"
+  REENTRY_KEEP_DAILY=0 REENTRY_KEEP_WEEKLY=0 REENTRY_KEEP_MONTHLY=0 run prune
+  check "kdf: prune removes an orphan .kdf file" [ ! -e "$REENTRY_BACKUP_DIR/mysql_shop_20200101T000000Z.sql.gz.enc.kdf" ]
+  check "kdf: and keeps the .kdf files of kept backups" [ "$(files '\.enc\.kdf$')" = 2 ]
+fi
+
 fresh o
 REENTRY_ENCRYPT=openssl run backup
 check "encryption on with no key setting exits 2" [ "$rc" = 2 ]
